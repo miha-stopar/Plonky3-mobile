@@ -1,0 +1,19 @@
+[package]
+name = "plonky3_jni"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[features]
+plonky3 = ["p3-poseidon2"]
+
+[dependencies]
+jni = "0.21"
+ash = "0.38"
+
+p3-poseidon2 = { path = "../../Plonky3/poseidon2", optional = true }
+
+[build-dependencies]
+naga = { version = "0.20", features = ["spv-out", "wgsl-in"] }

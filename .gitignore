@@ -1,0 +1,16 @@
+.DS_Store
+
+# Gradle/Android
+.gradle/
+**/build/
+local.properties
+.externalNativeBuild/
+.cxx/
+captures/
+*.iml
+.idea/
+
+# Rust
+target/
+**/target/
+*.rs.bk
