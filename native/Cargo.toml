@@ -7,13 +7,40 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [features]
-plonky3 = ["p3-poseidon2"]
+plonky3 = [
+    "p3-air",
+    "p3-baby-bear",
+    "p3-challenger",
+    "p3-commit",
+    "p3-dft",
+    "p3-field",
+    "p3-fri",
+    "p3-keccak",
+    "p3-matrix",
+    "p3-merkle-tree",
+    "p3-symmetric",
+    "p3-uni-stark",
+    "rand",
+]
+gpu = []
 
 [dependencies]
 jni = "0.21"
 ash = "0.38"
+rand = { version = "0.9.0", default-features = false, optional = true, features = ["small_rng"] }
 
-p3-poseidon2 = { path = "../../Plonky3/poseidon2", optional = true }
+p3-air = { path = "../../Plonky3/air", optional = true }
+p3-baby-bear = { path = "../../Plonky3/baby-bear", optional = true }
+p3-challenger = { path = "../../Plonky3/challenger", optional = true }
+p3-commit = { path = "../../Plonky3/commit", optional = true }
+p3-dft = { path = "../../Plonky3/dft", optional = true }
+p3-field = { path = "../../Plonky3/field", optional = true }
+p3-fri = { path = "../../Plonky3/fri", optional = true }
+p3-keccak = { path = "../../Plonky3/keccak", optional = true }
+p3-matrix = { path = "../../Plonky3/matrix", optional = true }
+p3-merkle-tree = { path = "../../Plonky3/merkle-tree", optional = true }
+p3-symmetric = { path = "../../Plonky3/symmetric", optional = true }
+p3-uni-stark = { path = "../../Plonky3/uni-stark", optional = true }
 
 [build-dependencies]
 naga = { version = "0.20", features = ["spv-out", "wgsl-in"] }

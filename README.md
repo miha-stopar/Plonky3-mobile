@@ -1,6 +1,6 @@
 # Plonky3 Android Vulkan
 
-Android app scaffolding with a Rust JNI library and a Vulkan compute proof-of-concept.
+Android app scaffolding with a Rust JNI library and a Plonky3 `fib_air` zk proof-of-concept.
 
 ## Requirements
 - Android Studio + SDK (compileSdk/targetSdk 34)
@@ -10,15 +10,21 @@ Android app scaffolding with a Rust JNI library and a Vulkan compute proof-of-co
 
 ## Build native library
 ```
-cargo ndk -t arm64-v8a -o app/src/main/jniLibs build --release --manifest-path native/Cargo.toml
+cargo ndk -t arm64-v8a -o app/src/main/jniLibs build --release --manifest-path native/Cargo.toml --features plonky3
 ```
 
 ## Run app
 Open the repo in Android Studio and run on a device (Galaxy A55 or any Vulkan-capable device).
 
-## Current GPU behavior
-The Vulkan compute shader runs a simple `+1` transformation over the input buffer. This is a stand-in for the Poseidon2 permutation kernel.
+## Current behavior
+- Runs a `fib_air` zk proof (modeled after `uni-stark/tests/fib_air.rs::test_zk`) in Rust.
+- The Android UI calls the Rust JNI entry point and displays `fib_air zk ok` if proof+verify succeed.
+
+## Enabling GPU path (placeholder)
+```
+cargo ndk -t arm64-v8a -o app/src/main/jniLibs build --release --manifest-path native/Cargo.toml --features "plonky3 gpu"
+```
 
 ## Next steps
-- Replace `native/shaders/add.wgsl` with a Poseidon2 permutation kernel.
-- Wire the kernel into the JNI call to match `poseidon2-air/examples/prove_poseidon2_baby_bear_keccak_zk.rs`.
+- Identify which parts of `fib_air` we want to offload first (e.g., LDE/FFT, Merkle hashing).
+- Implement a GPU-backed path behind the same JNI entry point.

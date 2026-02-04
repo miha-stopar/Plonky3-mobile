@@ -23,7 +23,8 @@ fn main() {
     .expect("emit SPIR-V");
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
-    fs::write(out_dir.join("add.spv"), spv).expect("write SPIR-V");
+    let spv_bytes: Vec<u8> = spv.into_iter().flat_map(u32::to_le_bytes).collect();
+    fs::write(out_dir.join("add.spv"), spv_bytes).expect("write SPIR-V");
 
     println!("cargo:rerun-if-changed=shaders/add.wgsl");
 }

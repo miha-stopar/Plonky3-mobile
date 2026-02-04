@@ -11,22 +11,21 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private external fun runPoseidonTest(input: IntArray): IntArray
+    private external fun runFibAirZk(): String
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
         val status = findViewById<TextView>(R.id.status)
-        val input = intArrayOf(1, 2, 3, 4, 5, 6, 7, 8)
 
         val output = try {
-            runPoseidonTest(input)
+            runFibAirZk()
         } catch (e: UnsatisfiedLinkError) {
             status.text = "Native library not loaded: ${e.message}"
             return
         }
 
-        status.text = "Input: ${input.joinToString()}\nOutput: ${output.joinToString()}"
+        status.text = output
     }
 }
