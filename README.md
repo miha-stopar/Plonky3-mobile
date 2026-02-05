@@ -25,6 +25,15 @@ Open the repo in Android Studio and run on a device (Galaxy A55 or any Vulkan-ca
 cargo ndk -t arm64-v8a -o app/src/main/jniLibs build --release --manifest-path native/Cargo.toml --features "plonky3 gpu"
 ```
 
+## Backend selection
+The Android app can select a backend at runtime via JNI:
+- `setBackend("cpu")`
+- `setBackend("vulkan")`
+- `setBackend("metal")`
+- `setBackend("webgpu")`
+
+Currently all GPU backends fall back to CPU until implemented.
+
 ## Next steps
-- Identify which parts of `fib_air` we want to offload first (e.g., LDE/FFT, Merkle hashing).
-- Implement a GPU-backed path behind the same JNI entry point.
+- Implement the Vulkan FFT/LDE kernel (first target).
+- Add Metal and WebGPU backends in parallel using the shared interface.

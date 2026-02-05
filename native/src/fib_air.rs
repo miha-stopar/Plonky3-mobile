@@ -4,7 +4,7 @@ use p3_air::{Air, AirBuilder, AirBuilderWithPublicValues, BaseAir};
 use p3_baby_bear::BabyBear;
 use p3_challenger::{HashChallenger, SerializingChallenger32};
 use p3_commit::ExtensionMmcs;
-use p3_dft::Radix2DitParallel;
+use crate::gpu_dft::{BackendKind, GpuDft};
 use p3_field::extension::BinomialExtensionField;
 use p3_field::{PrimeCharacteristicRing, PrimeField64};
 use p3_fri::{HidingFriPcs, create_test_fri_params};
@@ -55,10 +55,10 @@ pub fn run_fib_air_zk() -> Result<String, String> {
     let x = 21;
 
     let challenge_mmcs = ChallengeHidingMmcs::new(val_mmcs.clone());
-    let dft = Radix2DitParallel::<Val>::default();
+    let dft = GpuDft::<Val>::with_backend(BackendKind::Vulkan);
     let trace = generate_trace_rows::<Val>(0, 1, n);
     let fri_params = create_test_fri_params(challenge_mmcs, 2);
-    type HidingPcs = HidingFriPcs<Val, Radix2DitParallel<Val>, ValHidingMmcs, ChallengeHidingMmcs, SmallRng>;
+    type HidingPcs = HidingFriPcs<Val, GpuDft<Val>, ValHidingMmcs, ChallengeHidingMmcs, SmallRng>;
     type MyHidingConfig = StarkConfig<HidingPcs, Challenge, Challenger>;
     let pcs = HidingPcs::new(dft, val_mmcs, fri_params, 4, SmallRng::seed_from_u64(1));
     let challenger = Challenger::from_hasher(vec![], byte_hash);
