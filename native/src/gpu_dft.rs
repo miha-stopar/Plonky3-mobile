@@ -90,8 +90,10 @@ impl<F: TwoAdicField + Ord> TwoAdicSubgroupDft<F> for GpuDft<F> {
     fn dft_batch(&self, mat: RowMajorMatrix<F>) -> Self::Evaluations {
         match self.backend {
             BackendKind::Cpu => self.cpu.dft_batch(mat).to_row_major_matrix(),
-            BackendKind::Vulkan => backend_vulkan::dft_batch(&self.cpu, mat.clone())
-                .unwrap_or_else(|_| self.cpu.dft_batch(mat).to_row_major_matrix()),
+            BackendKind::Vulkan => match backend_vulkan::dft_batch(&self.cpu, mat) {
+                Ok(result) => result,
+                Err(err) => panic!("vulkan backend error: {err}"),
+            },
             BackendKind::Metal => backend_metal::dft_batch(&self.cpu, mat.clone())
                 .unwrap_or_else(|_| self.cpu.dft_batch(mat).to_row_major_matrix()),
             BackendKind::WebGpu => backend_webgpu::dft_batch(&self.cpu, mat.clone())
