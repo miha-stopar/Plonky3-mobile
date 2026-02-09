@@ -38,7 +38,7 @@ impl BackendKind {
     }
 }
 
-static BACKEND_KIND: AtomicU8 = AtomicU8::new(0);
+static BACKEND_KIND: AtomicU8 = AtomicU8::new(1);
 
 pub fn set_backend_kind(kind: BackendKind) {
     BACKEND_KIND.store(kind.to_u8(), Ordering::Relaxed);

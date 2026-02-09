@@ -70,3 +70,18 @@ pub extern "system" fn Java_com_plonk3_android_MainActivity_setBackend(
 ) {
     Java_com_plonky3_android_MainActivity_setBackend(env, class, backend);
 }
+
+#[no_mangle]
+pub extern "system" fn Java_com_plonky3_android_MainActivity_isVulkanAvailable(
+    mut env: JNIEnv,
+    _class: JClass,
+) -> jstring {
+    let message = match backend_vulkan::is_vulkan_available() {
+        Ok(()) => "Vulkan available".to_string(),
+        Err(err) => format!("Vulkan unavailable: {err}"),
+    };
+    match env.new_string(message) {
+        Ok(value) => value.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}

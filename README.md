@@ -1,12 +1,14 @@
-# Plonky3 Android Vulkan
+# Plonky3 Mobile (GPU Backends)
 
-Android app scaffolding with a Rust JNI library and a Plonky3 `fib_air` zk proof-of-concept.
+Mobile-focused scaffolding for Plonky3 with a Rust core and planned Vulkan/Metal/WebGPU GPU backends. The current app target is Android, with iOS/Metal intended for parity.
 
 ## Requirements
 - Android Studio + SDK (compileSdk/targetSdk 34)
 - NDK (API 26+)
 - Rust toolchain
 - `cargo-ndk`
+Optional for Metal backend development (macOS):
+- Xcode + Metal SDK
 
 ## Build native library
 ```

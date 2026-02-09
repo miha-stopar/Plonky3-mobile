@@ -87,6 +87,11 @@ impl VulkanContext {
     }
 }
 
+pub fn is_vulkan_available() -> Result<(), String> {
+    let _ctx = VulkanContext::create()?;
+    Ok(())
+}
+
 impl Drop for VulkanContext {
     fn drop(&mut self) {
         unsafe {
@@ -465,7 +470,6 @@ pub fn setup_vulkan_pipeline_plan(_plan: &VulkanComputePlan) -> Result<(), Strin
     let _ = descriptor_set;
     Err("vulkan pipeline setup not implemented (dispatch + readback wired)".to_string())
 }
-
 pub fn dft_batch<F: TwoAdicField>(
     _cpu: &Radix2DitParallel<F>,
     mat: RowMajorMatrix<F>,

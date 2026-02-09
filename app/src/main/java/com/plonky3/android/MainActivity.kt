@@ -13,6 +13,7 @@ class MainActivity : AppCompatActivity() {
 
     private external fun runFibAirZk(): String
     private external fun setBackend(backend: String)
+    private external fun isVulkanAvailable(): String
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -22,7 +23,9 @@ class MainActivity : AppCompatActivity() {
 
         val output = try {
             setBackend("vulkan")
-            runFibAirZk()
+            val vkStatus = isVulkanAvailable()
+            val result = runFibAirZk()
+            "$vkStatus\n$result"
         } catch (e: UnsatisfiedLinkError) {
             status.text = "Native library not loaded: ${e.message}"
             return
