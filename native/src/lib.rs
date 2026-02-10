@@ -1,6 +1,8 @@
 use jni::objects::{JClass, JString};
 use jni::sys::jstring;
 use jni::JNIEnv;
+use std::ffi::CString;
+use std::os::raw::c_char;
 
 #[cfg(feature = "plonky3")]
 mod fib_air;
@@ -13,6 +15,25 @@ mod backend_metal;
 #[cfg(feature = "plonky3")]
 mod backend_webgpu;
 
+#[cfg(target_os = "android")]
+const ANDROID_LOG_INFO: i32 = 4;
+#[cfg(target_os = "android")]
+const ANDROID_LOG_ERROR: i32 = 6;
+
+#[cfg(target_os = "android")]
+extern "C" {
+    fn __android_log_write(prio: i32, tag: *const c_char, text: *const c_char) -> i32;
+}
+
+#[cfg(target_os = "android")]
+fn log_android(prio: i32, message: &str) {
+    let tag = CString::new("plonky3").unwrap_or_else(|_| CString::new("plonky3").unwrap());
+    let text = CString::new(message).unwrap_or_else(|_| CString::new("log message contains NUL").unwrap());
+    unsafe {
+        let _ = __android_log_write(prio, tag.as_ptr(), text.as_ptr());
+    }
+}
+
 #[no_mangle]
 pub extern "system" fn Java_com_plonky3_android_MainActivity_runFibAirZk(
     mut env: JNIEnv,
@@ -21,10 +42,35 @@ pub extern "system" fn Java_com_plonky3_android_MainActivity_runFibAirZk(
     let message = {
         #[cfg(feature = "plonky3")]
         {
-            match fib_air::run_fib_air_zk() {
-                Ok(value) => value,
-                Err(err) => format!("fib_air zk failed: {err}"),
+            let run = std::panic::catch_unwind(|| fib_air::run_fib_air_zk());
+            let mut result = match run {
+                Ok(Ok(value)) => value,
+                Ok(Err(err)) => format!("fib_air zk failed: {err}"),
+                Err(payload) => {
+                    let msg = if let Some(s) = payload.downcast_ref::<&str>() {
+                        (*s).to_string()
+                    } else if let Some(s) = payload.downcast_ref::<String>() {
+                        s.clone()
+                    } else {
+                        "unknown panic".to_string()
+                    };
+                    format!("fib_air zk panicked: {msg}")
+                }
+            };
+            if let Some(err) = gpu_dft::take_last_vulkan_error() {
+                result.push_str("\nVulkan error: ");
+                result.push_str(&err);
             }
+            #[cfg(target_os = "android")]
+            {
+                let prio = if result.contains("failed") || result.contains("panicked") {
+                    ANDROID_LOG_ERROR
+                } else {
+                    ANDROID_LOG_INFO
+                };
+                log_android(prio, &result);
+            }
+            result
         }
         #[cfg(not(feature = "plonky3"))]
         {

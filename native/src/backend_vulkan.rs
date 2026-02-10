@@ -1,5 +1,6 @@
-use p3_dft::Radix2DitParallel;
-use p3_field::TwoAdicField;
+use p3_baby_bear::BabyBear;
+use p3_dft::{Radix2DitParallel, TwoAdicSubgroupDft};
+use p3_field::{PrimeCharacteristicRing, PrimeField32, TwoAdicField};
 use p3_matrix::Matrix;
 use p3_matrix::dense::RowMajorMatrix;
 use ash::vk;
@@ -133,37 +134,88 @@ pub fn fft_stage_spv() -> &'static [u8] {
 }
 
 pub fn dispatch_dims(params: &FftStageParams) -> (u32, u32, u32) {
-    // Each thread handles one (row, j) pair. j ranges over width/2 for each row.
-    let half = 1u32 << params.stage;
-    let j_count = (params.width + 1).max(1) / 2;
-    let x = j_count.max(half);
-    (x, params.height.max(1), 1)
+    // Each thread handles one (col, j) pair.
+    // j ranges over height/2 for each column.
+    let j_count = (params.height.max(1)) / 2;
+    let x = params.width.max(1);
+    (x, j_count.max(1), 1)
 }
 
-pub fn cpu_stage_u32_in_place(data: &mut [u32], params: FftStageParams) {
+pub fn cpu_stage_u32_in_place(data: &mut [u32], params: FftStageParams, twiddles: &[u32]) {
+    const PRIME: u32 = 0x7800_0001;
+    const MONTY_MU: u32 = 0x8800_0001;
+    const MONTY_MASK: u64 = 0xffff_ffff;
+
+    fn add_mod(a: u32, b: u32) -> u32 {
+        let sum = a.wrapping_add(b);
+        if sum >= PRIME {
+            sum - PRIME
+        } else {
+            sum
+        }
+    }
+
+    fn sub_mod(a: u32, b: u32) -> u32 {
+        if a >= b {
+            a - b
+        } else {
+            a.wrapping_add(PRIME) - b
+        }
+    }
+
+    fn monty_reduce(x: u64) -> u32 {
+        let t = x.wrapping_mul(MONTY_MU as u64) & MONTY_MASK;
+        let u = t * (PRIME as u64);
+        let (x_sub_u, over) = x.overflowing_sub(u);
+        let x_sub_u_hi = (x_sub_u >> 32) as u32;
+        if over {
+            x_sub_u_hi.wrapping_add(PRIME)
+        } else {
+            x_sub_u_hi
+        }
+    }
+
+    fn mul_mod(a: u32, b: u32) -> u32 {
+        monty_reduce((a as u64) * (b as u64))
+    }
+
     let width = params.width as usize;
     let height = params.height as usize;
     let stage = params.stage as usize;
     let m = 1usize << (stage + 1);
     let half = m >> 1;
 
-    for row in 0..height {
-        let row_start = row * width;
-        for j in 0..(width / 2) {
+    for col in 0..width {
+        for j in 0..(height / 2) {
             let block = j / half;
             let offset = j % half;
             let base = block * m + offset;
-            if base + half >= width {
+            if base + half >= height {
                 continue;
             }
-            let idx0 = row_start + base;
-            let idx1 = idx0 + half;
+            let idx0 = base * width + col;
+            let idx1 = (base + half) * width + col;
             let a = data[idx0];
             let b = data[idx1];
-            let t = b.wrapping_mul(params.twiddle_base);
-            data[idx0] = a.wrapping_add(t);
-            data[idx1] = a.wrapping_sub(t);
+            let t = mul_mod(b, twiddles[offset]);
+            data[idx0] = add_mod(a, t);
+            data[idx1] = sub_mod(a, t);
         }
+    }
+}
+
+fn monty_to_canonical(x: u32) -> u32 {
+    const PRIME: u32 = 0x7800_0001;
+    const MONTY_MU: u32 = 0x8800_0001;
+    const MONTY_MASK: u64 = 0xffff_ffff;
+    let t = (x as u64).wrapping_mul(MONTY_MU as u64) & MONTY_MASK;
+    let u = t * (PRIME as u64);
+    let (x_sub_u, over) = (x as u64).overflowing_sub(u);
+    let x_sub_u_hi = (x_sub_u >> 32) as u32;
+    if over {
+        x_sub_u_hi.wrapping_add(PRIME)
+    } else {
+        x_sub_u_hi
     }
 }
 
@@ -185,7 +237,23 @@ pub fn prepare_compute_plan(width: usize, height: usize, stage: u32, log_n: u32)
     }
 }
 
-pub fn setup_vulkan_pipeline_plan(_plan: &VulkanComputePlan) -> Result<(), String> {
+fn twiddles_for_stage(log_n: u32, stage: u32) -> Vec<u32> {
+    let half = 1usize << stage;
+    if half == 0 {
+        return Vec::new();
+    }
+    let root = BabyBear::two_adic_generator(log_n as usize);
+    let step = root.exp_power_of_2((log_n - stage - 1) as usize);
+    step.powers()
+        .take(half)
+        .map(|v: BabyBear| v.to_unique_u32())
+        .collect()
+}
+
+pub fn setup_vulkan_pipeline_plan(
+    plan: &VulkanComputePlan,
+    input: &[u32],
+) -> Result<Vec<u32>, String> {
     // Pipeline setup outline (not implemented yet):
     // 1) Create instance + select physical device.
     // 2) Create logical device + compute queue.
@@ -217,6 +285,11 @@ pub fn setup_vulkan_pipeline_plan(_plan: &VulkanComputePlan) -> Result<(), Strin
         vk::DescriptorSetLayoutBinding::default()
             .binding(1)
             .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::COMPUTE),
+        vk::DescriptorSetLayoutBinding::default()
+            .binding(2)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
             .descriptor_count(1)
             .stage_flags(vk::ShaderStageFlags::COMPUTE),
     ];
@@ -259,6 +332,10 @@ pub fn setup_vulkan_pipeline_plan(_plan: &VulkanComputePlan) -> Result<(), Strin
             ty: vk::DescriptorType::UNIFORM_BUFFER,
             descriptor_count: 1,
         },
+        vk::DescriptorPoolSize {
+            ty: vk::DescriptorType::STORAGE_BUFFER,
+            descriptor_count: 1,
+        },
     ];
     let descriptor_pool_info = vk::DescriptorPoolCreateInfo::default()
         .pool_sizes(&descriptor_pool_sizes)
@@ -280,8 +357,10 @@ pub fn setup_vulkan_pipeline_plan(_plan: &VulkanComputePlan) -> Result<(), Strin
     };
 
     // Buffer creation and descriptor writes (host-visible for now).
-    let data_size = 4usize * 16;
+    let data_size = 4usize * input.len();
     let params_size = core::mem::size_of::<FftStageParams>();
+    let twiddle_count = (plan.params.height as usize / 2).max(1);
+    let twiddle_size = 4usize * twiddle_count;
 
     let buffer_info = vk::BufferCreateInfo::default()
         .size(data_size as u64)
@@ -302,9 +381,19 @@ pub fn setup_vulkan_pipeline_plan(_plan: &VulkanComputePlan) -> Result<(), Strin
             .create_buffer(&uniform_info, None)
             .map_err(|e| format!("vk create params buffer: {e}"))?
     };
+    let twiddle_info = vk::BufferCreateInfo::default()
+        .size(twiddle_size as u64)
+        .usage(vk::BufferUsageFlags::STORAGE_BUFFER)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE);
+    let twiddle_buffer = unsafe {
+        ctx.device
+            .create_buffer(&twiddle_info, None)
+            .map_err(|e| format!("vk create twiddle buffer: {e}"))?
+    };
 
     let data_reqs = unsafe { ctx.device.get_buffer_memory_requirements(data_buffer) };
     let params_reqs = unsafe { ctx.device.get_buffer_memory_requirements(params_buffer) };
+    let twiddle_reqs = unsafe { ctx.device.get_buffer_memory_requirements(twiddle_buffer) };
     let mem_props = unsafe {
         ctx.instance
             .get_physical_device_memory_properties(ctx.physical_device)
@@ -320,6 +409,7 @@ pub fn setup_vulkan_pipeline_plan(_plan: &VulkanComputePlan) -> Result<(), Strin
     };
     let data_mem_type = find_type(data_reqs)?;
     let params_mem_type = find_type(params_reqs)?;
+    let twiddle_mem_type = find_type(twiddle_reqs)?;
 
     let data_alloc = vk::MemoryAllocateInfo::default()
         .allocation_size(data_reqs.size)
@@ -327,6 +417,9 @@ pub fn setup_vulkan_pipeline_plan(_plan: &VulkanComputePlan) -> Result<(), Strin
     let params_alloc = vk::MemoryAllocateInfo::default()
         .allocation_size(params_reqs.size)
         .memory_type_index(params_mem_type);
+    let twiddle_alloc = vk::MemoryAllocateInfo::default()
+        .allocation_size(twiddle_reqs.size)
+        .memory_type_index(twiddle_mem_type);
     let data_memory = unsafe {
         ctx.device
             .allocate_memory(&data_alloc, None)
@@ -337,6 +430,11 @@ pub fn setup_vulkan_pipeline_plan(_plan: &VulkanComputePlan) -> Result<(), Strin
             .allocate_memory(&params_alloc, None)
             .map_err(|e| format!("vk alloc params memory: {e}"))?
     };
+    let twiddle_memory = unsafe {
+        ctx.device
+            .allocate_memory(&twiddle_alloc, None)
+            .map_err(|e| format!("vk alloc twiddle memory: {e}"))?
+    };
     unsafe {
         ctx.device
             .bind_buffer_memory(data_buffer, data_memory, 0)
@@ -344,6 +442,9 @@ pub fn setup_vulkan_pipeline_plan(_plan: &VulkanComputePlan) -> Result<(), Strin
         ctx.device
             .bind_buffer_memory(params_buffer, params_memory, 0)
             .map_err(|e| format!("vk bind params memory: {e}"))?;
+        ctx.device
+            .bind_buffer_memory(twiddle_buffer, twiddle_memory, 0)
+            .map_err(|e| format!("vk bind twiddle memory: {e}"))?;
     }
 
     let data_buffer_info = vk::DescriptorBufferInfo::default()
@@ -354,6 +455,10 @@ pub fn setup_vulkan_pipeline_plan(_plan: &VulkanComputePlan) -> Result<(), Strin
         .buffer(params_buffer)
         .offset(0)
         .range(params_size as u64);
+    let twiddle_buffer_info = vk::DescriptorBufferInfo::default()
+        .buffer(twiddle_buffer)
+        .offset(0)
+        .range(twiddle_size as u64);
     let writes = [
         vk::WriteDescriptorSet::default()
             .dst_set(descriptor_set)
@@ -365,79 +470,98 @@ pub fn setup_vulkan_pipeline_plan(_plan: &VulkanComputePlan) -> Result<(), Strin
             .dst_binding(1)
             .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
             .buffer_info(core::slice::from_ref(&params_buffer_info)),
+        vk::WriteDescriptorSet::default()
+            .dst_set(descriptor_set)
+            .dst_binding(2)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(core::slice::from_ref(&twiddle_buffer_info)),
     ];
     unsafe {
         ctx.device.update_descriptor_sets(&writes, &[]);
     }
 
-    // Write sample data + params.
-    let params = params_for_stage(16, 1, 0, 4, 1);
+    // Write input data + params + twiddles.
+    let mut params = plan.params;
     unsafe {
         let data_ptr = ctx
             .device
             .map_memory(data_memory, 0, data_size as u64, vk::MemoryMapFlags::empty())
             .map_err(|e| format!("vk map data memory: {e}"))?;
-        let params_ptr = ctx
-            .device
-            .map_memory(params_memory, 0, params_size as u64, vk::MemoryMapFlags::empty())
-            .map_err(|e| format!("vk map params memory: {e}"))?;
-
         let data_slice = core::slice::from_raw_parts_mut(data_ptr as *mut u32, data_size / 4);
-        for (i, value) in data_slice.iter_mut().enumerate() {
-            *value = i as u32;
-        }
-        let params_slice = core::slice::from_raw_parts_mut(params_ptr as *mut FftStageParams, 1);
-        params_slice[0] = params;
-
+        data_slice.copy_from_slice(input);
         ctx.device.unmap_memory(data_memory);
-        ctx.device.unmap_memory(params_memory);
     }
 
-    // Record and dispatch a compute command buffer (single stage).
+    // Run all FFT stages.
     let alloc_info = vk::CommandBufferAllocateInfo::default()
         .command_pool(ctx.command_pool)
         .level(vk::CommandBufferLevel::PRIMARY)
         .command_buffer_count(1);
-    let command_buffer = unsafe {
-        ctx.device
-            .allocate_command_buffers(&alloc_info)
-            .map_err(|e| format!("vk allocate command buffer: {e}"))?
-            .remove(0)
-    };
-    let begin_info =
-        vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-    unsafe {
-        ctx.device
-            .begin_command_buffer(command_buffer, &begin_info)
-            .map_err(|e| format!("vk begin command buffer: {e}"))?;
-        ctx.device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::COMPUTE, pipeline);
-        ctx.device.cmd_bind_descriptor_sets(
-            command_buffer,
-            vk::PipelineBindPoint::COMPUTE,
-            pipeline_layout,
-            0,
-            core::slice::from_ref(&descriptor_set),
-            &[],
-        );
-        let dispatch = dispatch_dims(&params);
-        ctx.device.cmd_dispatch(command_buffer, dispatch.0, dispatch.1, dispatch.2);
-        ctx.device
-            .end_command_buffer(command_buffer)
-            .map_err(|e| format!("vk end command buffer: {e}"))?;
+    for stage in 0..params.log_n {
+        params.stage = stage;
+        let stage_twiddles = twiddles_for_stage(params.log_n, stage);
+
+        unsafe {
+            let params_ptr = ctx
+                .device
+                .map_memory(params_memory, 0, params_size as u64, vk::MemoryMapFlags::empty())
+                .map_err(|e| format!("vk map params memory: {e}"))?;
+            let params_slice = core::slice::from_raw_parts_mut(params_ptr as *mut FftStageParams, 1);
+            params_slice[0] = params;
+            ctx.device.unmap_memory(params_memory);
+
+            let twiddle_ptr = ctx
+                .device
+                .map_memory(twiddle_memory, 0, twiddle_size as u64, vk::MemoryMapFlags::empty())
+                .map_err(|e| format!("vk map twiddle memory: {e}"))?;
+            let twiddle_slice =
+                core::slice::from_raw_parts_mut(twiddle_ptr as *mut u32, twiddle_count);
+            twiddle_slice[..stage_twiddles.len()].copy_from_slice(&stage_twiddles);
+            ctx.device.unmap_memory(twiddle_memory);
+        }
+
+        let command_buffer = unsafe {
+            ctx.device
+                .allocate_command_buffers(&alloc_info)
+                .map_err(|e| format!("vk allocate command buffer: {e}"))?
+                .remove(0)
+        };
+        let begin_info =
+            vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        unsafe {
+            ctx.device
+                .begin_command_buffer(command_buffer, &begin_info)
+                .map_err(|e| format!("vk begin command buffer: {e}"))?;
+            ctx.device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::COMPUTE, pipeline);
+            ctx.device.cmd_bind_descriptor_sets(
+                command_buffer,
+                vk::PipelineBindPoint::COMPUTE,
+                pipeline_layout,
+                0,
+                core::slice::from_ref(&descriptor_set),
+                &[],
+            );
+            let dispatch = dispatch_dims(&params);
+            ctx.device.cmd_dispatch(command_buffer, dispatch.0, dispatch.1, dispatch.2);
+            ctx.device
+                .end_command_buffer(command_buffer)
+                .map_err(|e| format!("vk end command buffer: {e}"))?;
+        }
+
+        let submit_info =
+            vk::SubmitInfo::default().command_buffers(core::slice::from_ref(&command_buffer));
+        unsafe {
+            ctx.device
+                .queue_submit(ctx.queue, core::slice::from_ref(&submit_info), vk::Fence::null())
+                .map_err(|e| format!("vk queue submit: {e}"))?;
+            ctx.device
+                .queue_wait_idle(ctx.queue)
+                .map_err(|e| format!("vk queue wait idle: {e}"))?;
+            ctx.device.free_command_buffers(ctx.command_pool, &[command_buffer]);
+        }
     }
 
-    let submit_info = vk::SubmitInfo::default().command_buffers(core::slice::from_ref(&command_buffer));
-    unsafe {
-        ctx.device
-            .queue_submit(ctx.queue, core::slice::from_ref(&submit_info), vk::Fence::null())
-            .map_err(|e| format!("vk queue submit: {e}"))?;
-        ctx.device
-            .queue_wait_idle(ctx.queue)
-            .map_err(|e| format!("vk queue wait idle: {e}"))?;
-        ctx.device.free_command_buffers(ctx.command_pool, &[command_buffer]);
-    }
-
-    // Read back data and compare against CPU stage.
+    // Read back data.
     let mut gpu_out = vec![0u32; data_size / 4];
     unsafe {
         let data_ptr = ctx
@@ -449,17 +573,13 @@ pub fn setup_vulkan_pipeline_plan(_plan: &VulkanComputePlan) -> Result<(), Strin
         ctx.device.unmap_memory(data_memory);
     }
 
-    let mut cpu_out: Vec<u32> = (0u32..(data_size as u32 / 4)).collect();
-    cpu_stage_u32_in_place(&mut cpu_out, params);
-    if gpu_out != cpu_out {
-        return Err("vulkan stage mismatch vs cpu (placeholder arithmetic)".to_string());
-    }
-
     unsafe {
         ctx.device.free_memory(data_memory, None);
         ctx.device.free_memory(params_memory, None);
+        ctx.device.free_memory(twiddle_memory, None);
         ctx.device.destroy_buffer(data_buffer, None);
         ctx.device.destroy_buffer(params_buffer, None);
+        ctx.device.destroy_buffer(twiddle_buffer, None);
         ctx.device.destroy_descriptor_pool(descriptor_pool, None);
         ctx.device.destroy_pipeline(pipeline, None);
         ctx.device.destroy_pipeline_layout(pipeline_layout, None);
@@ -468,14 +588,66 @@ pub fn setup_vulkan_pipeline_plan(_plan: &VulkanComputePlan) -> Result<(), Strin
     }
 
     let _ = descriptor_set;
-    Err("vulkan pipeline setup not implemented (dispatch + readback wired)".to_string())
+    Ok(gpu_out)
 }
 pub fn dft_batch<F: TwoAdicField>(
     _cpu: &Radix2DitParallel<F>,
     mat: RowMajorMatrix<F>,
 ) -> Result<RowMajorMatrix<F>, String> {
-    let log_n = mat.height().next_power_of_two().trailing_zeros();
+    let height = mat.height();
+    if !height.is_power_of_two() {
+        return Err(format!("vulkan backend requires power-of-two height, got {height}"));
+    }
+    let log_n = height.trailing_zeros();
     let plan = prepare_compute_plan(mat.width(), mat.height(), 0, log_n);
-    let _ = setup_vulkan_pipeline_plan(&plan);
-    Err("vulkan backend not implemented (shader compiled, params wired, cpu stage ready)".to_string())
+    let input = {
+        if core::any::TypeId::of::<F>() != core::any::TypeId::of::<BabyBear>() {
+            return Err("vulkan backend currently only supports BabyBear".to_string());
+        }
+        let values = &mat.values;
+        let ptr = values.as_ptr() as *const BabyBear;
+        let bb_slice = unsafe { core::slice::from_raw_parts(ptr, values.len()) };
+        bb_slice.iter().map(|v| v.to_unique_u32()).collect::<Vec<u32>>()
+    };
+    let gpu_out = setup_vulkan_pipeline_plan(&plan, &input)?;
+
+    // For now, only support BabyBear in the Vulkan path.
+    if core::any::TypeId::of::<F>() != core::any::TypeId::of::<BabyBear>() {
+        return Err("vulkan backend currently only supports BabyBear".to_string());
+    }
+
+    let out_vals: Vec<BabyBear> = gpu_out
+        .into_iter()
+        .map(|v| BabyBear::new(monty_to_canonical(v)))
+        .collect();
+    let mat = RowMajorMatrix::new(out_vals, plan.params.width as usize);
+
+    // Compare against CPU reference to pinpoint mismatches (BabyBear only).
+    if core::any::TypeId::of::<F>() == core::any::TypeId::of::<BabyBear>() {
+        let cpu_bb = Radix2DitParallel::<BabyBear>::default();
+        let cpu_out = cpu_bb.dft_batch(mat.clone());
+        let gpu_vals = &mat.values;
+        let cpu_vals = &cpu_out.inner.values;
+        if gpu_vals.len() != cpu_vals.len() {
+            return Err(format!(
+                "gpu/cpu length mismatch: gpu {} vs cpu {}",
+                gpu_vals.len(),
+                cpu_vals.len()
+            ));
+        }
+        for (idx, (g, c)) in gpu_vals.iter().zip(cpu_vals.iter()).enumerate() {
+            if g != c {
+                return Err(format!(
+                    "vulkan dft mismatch at idx {idx}: gpu={} cpu={}",
+                    g.to_unique_u32(),
+                    c.to_unique_u32()
+                ));
+            }
+        }
+    }
+
+    // Safety: we just checked F == BabyBear.
+    let ptr = Box::into_raw(Box::new(mat)) as *mut RowMajorMatrix<F>;
+    let result = unsafe { *Box::from_raw(ptr) };
+    Ok(result)
 }

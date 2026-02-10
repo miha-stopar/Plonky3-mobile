@@ -1,4 +1,5 @@
 use core::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Mutex;
 
 use p3_dft::TwoAdicSubgroupDft;
 use p3_field::TwoAdicField;
@@ -39,6 +40,7 @@ impl BackendKind {
 }
 
 static BACKEND_KIND: AtomicU8 = AtomicU8::new(1);
+static LAST_VULKAN_ERROR: Mutex<Option<String>> = Mutex::new(None);
 
 pub fn set_backend_kind(kind: BackendKind) {
     BACKEND_KIND.store(kind.to_u8(), Ordering::Relaxed);
@@ -58,6 +60,11 @@ pub fn set_backend_kind_from_str(value: &str) -> Result<(), String> {
     };
     set_backend_kind(kind);
     Ok(())
+}
+
+pub fn take_last_vulkan_error() -> Option<String> {
+    let mut guard = LAST_VULKAN_ERROR.lock().ok()?;
+    guard.take()
 }
 
 #[derive(Clone, Debug)]
@@ -90,9 +97,14 @@ impl<F: TwoAdicField + Ord> TwoAdicSubgroupDft<F> for GpuDft<F> {
     fn dft_batch(&self, mat: RowMajorMatrix<F>) -> Self::Evaluations {
         match self.backend {
             BackendKind::Cpu => self.cpu.dft_batch(mat).to_row_major_matrix(),
-            BackendKind::Vulkan => match backend_vulkan::dft_batch(&self.cpu, mat) {
+            BackendKind::Vulkan => match backend_vulkan::dft_batch(&self.cpu, mat.clone()) {
                 Ok(result) => result,
-                Err(err) => panic!("vulkan backend error: {err}"),
+                Err(err) => {
+                    if let Ok(mut guard) = LAST_VULKAN_ERROR.lock() {
+                        *guard = Some(err);
+                    }
+                    self.cpu.dft_batch(mat).to_row_major_matrix()
+                }
             },
             BackendKind::Metal => backend_metal::dft_batch(&self.cpu, mat.clone())
                 .unwrap_or_else(|_| self.cpu.dft_batch(mat).to_row_major_matrix()),
