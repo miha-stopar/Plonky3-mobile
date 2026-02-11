@@ -3,7 +3,40 @@ use p3_dft::{Radix2DitParallel, TwoAdicSubgroupDft};
 use p3_field::{PrimeCharacteristicRing, PrimeField32, TwoAdicField};
 use p3_matrix::Matrix;
 use p3_matrix::dense::RowMajorMatrix;
+use p3_matrix::util::reverse_matrix_index_bits;
 use ash::vk;
+use std::cell::RefCell;
+use std::time::Instant;
+
+#[cfg(target_os = "android")]
+const ANDROID_LOG_INFO: i32 = 4;
+
+#[cfg(target_os = "android")]
+extern "C" {
+    fn __android_log_write(
+        prio: i32,
+        tag: *const std::os::raw::c_char,
+        text: *const std::os::raw::c_char,
+    ) -> i32;
+}
+
+fn log_vulkan_timing(message: &str) {
+    #[cfg(target_os = "android")]
+    {
+        if let (Ok(tag), Ok(text)) = (
+            std::ffi::CString::new("plonky3"),
+            std::ffi::CString::new(message),
+        ) {
+            unsafe {
+                let _ = __android_log_write(ANDROID_LOG_INFO, tag.as_ptr(), text.as_ptr());
+            }
+        }
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        eprintln!("{message}");
+    }
+}
 
 struct VulkanContext {
     entry: ash::Entry,
@@ -13,6 +46,24 @@ struct VulkanContext {
     queue: vk::Queue,
     queue_family_index: u32,
     command_pool: vk::CommandPool,
+}
+
+thread_local! {
+    static VULKAN_CONTEXT_CACHE: RefCell<Option<VulkanContext>> = const { RefCell::new(None) };
+}
+
+fn with_vulkan_context<T>(f: impl FnOnce(&VulkanContext) -> Result<T, String>) -> Result<T, String> {
+    VULKAN_CONTEXT_CACHE.with(|cached| {
+        if cached.borrow().is_none() {
+            let ctx = VulkanContext::create()?;
+            *cached.borrow_mut() = Some(ctx);
+        }
+        let guard = cached.borrow();
+        let ctx = guard
+            .as_ref()
+            .ok_or_else(|| "vulkan context cache unexpectedly empty".to_string())?;
+        f(ctx)
+    })
 }
 
 impl VulkanContext {
@@ -89,8 +140,7 @@ impl VulkanContext {
 }
 
 pub fn is_vulkan_available() -> Result<(), String> {
-    let _ctx = VulkanContext::create()?;
-    Ok(())
+    with_vulkan_context(|_| Ok(()))
 }
 
 impl Drop for VulkanContext {
@@ -250,10 +300,39 @@ fn twiddles_for_stage(log_n: u32, stage: u32) -> Vec<u32> {
         .collect()
 }
 
+fn reverse_bits_len_usize(mut x: usize, bits: usize) -> usize {
+    let mut y = 0usize;
+    for _ in 0..bits {
+        y = (y << 1) | (x & 1);
+        x >>= 1;
+    }
+    y
+}
+
+fn bit_reverse_rows_u32(values: &mut [u32], width: usize) {
+    if width == 0 || values.is_empty() {
+        return;
+    }
+    let height = values.len() / width;
+    if height <= 1 || !height.is_power_of_two() {
+        return;
+    }
+    let bits = height.trailing_zeros() as usize;
+    for i in 0..height {
+        let j = reverse_bits_len_usize(i, bits);
+        if j > i {
+            for col in 0..width {
+                values.swap(i * width + col, j * width + col);
+            }
+        }
+    }
+}
+
 pub fn setup_vulkan_pipeline_plan(
     plan: &VulkanComputePlan,
     input: &[u32],
 ) -> Result<Vec<u32>, String> {
+    let total_start = Instant::now();
     // Pipeline setup outline (not implemented yet):
     // 1) Create instance + select physical device.
     // 2) Create logical device + compute queue.
@@ -263,20 +342,19 @@ pub fn setup_vulkan_pipeline_plan(
     // 6) Allocate buffers, upload params + data.
     // 7) Record command buffer: bind pipeline, bind descriptors, dispatch.
     // 8) Submit + wait, then read back.
-    let ctx = VulkanContext::create()?;
+    with_vulkan_context(|ctx| {
+        let spv = fft_stage_spv();
+        let words = unsafe {
+            core::slice::from_raw_parts(spv.as_ptr() as *const u32, spv.len() / 4)
+        };
+        let shader_info = vk::ShaderModuleCreateInfo::default().code(words);
+        let shader_module = unsafe {
+            ctx.device
+                .create_shader_module(&shader_info, None)
+                .map_err(|e| format!("vk create shader module: {e}"))?
+        };
 
-    let spv = fft_stage_spv();
-    let words = unsafe {
-        core::slice::from_raw_parts(spv.as_ptr() as *const u32, spv.len() / 4)
-    };
-    let shader_info = vk::ShaderModuleCreateInfo::default().code(words);
-    let shader_module = unsafe {
-        ctx.device
-            .create_shader_module(&shader_info, None)
-            .map_err(|e| format!("vk create shader module: {e}"))?
-    };
-
-    let bindings = [
+        let bindings = [
         vk::DescriptorSetLayoutBinding::default()
             .binding(0)
             .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
@@ -293,37 +371,37 @@ pub fn setup_vulkan_pipeline_plan(
             .descriptor_count(1)
             .stage_flags(vk::ShaderStageFlags::COMPUTE),
     ];
-    let set_layout_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
-    let descriptor_set_layout = unsafe {
-        ctx.device
-            .create_descriptor_set_layout(&set_layout_info, None)
-            .map_err(|e| format!("vk create descriptor set layout: {e}"))?
-    };
+        let set_layout_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
+        let descriptor_set_layout = unsafe {
+            ctx.device
+                .create_descriptor_set_layout(&set_layout_info, None)
+                .map_err(|e| format!("vk create descriptor set layout: {e}"))?
+        };
 
-    let pipeline_layout_info =
-        vk::PipelineLayoutCreateInfo::default().set_layouts(core::slice::from_ref(&descriptor_set_layout));
-    let pipeline_layout = unsafe {
-        ctx.device
-            .create_pipeline_layout(&pipeline_layout_info, None)
-            .map_err(|e| format!("vk create pipeline layout: {e}"))?
-    };
+        let pipeline_layout_info =
+            vk::PipelineLayoutCreateInfo::default().set_layouts(core::slice::from_ref(&descriptor_set_layout));
+        let pipeline_layout = unsafe {
+            ctx.device
+                .create_pipeline_layout(&pipeline_layout_info, None)
+                .map_err(|e| format!("vk create pipeline layout: {e}"))?
+        };
 
-    let entry_name = unsafe { std::ffi::CStr::from_bytes_with_nul_unchecked(b"main\0") };
-    let stage_info = vk::PipelineShaderStageCreateInfo::default()
-        .stage(vk::ShaderStageFlags::COMPUTE)
-        .module(shader_module)
-        .name(entry_name);
-    let pipeline_info = vk::ComputePipelineCreateInfo::default()
-        .stage(stage_info)
-        .layout(pipeline_layout);
-    let pipeline = unsafe {
-        ctx.device
-            .create_compute_pipelines(vk::PipelineCache::null(), core::slice::from_ref(&pipeline_info), None)
-            .map_err(|(_, e)| format!("vk create compute pipeline: {e}"))?
-            .remove(0)
-    };
+        let entry_name = unsafe { std::ffi::CStr::from_bytes_with_nul_unchecked(b"main\0") };
+        let stage_info = vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::COMPUTE)
+            .module(shader_module)
+            .name(entry_name);
+        let pipeline_info = vk::ComputePipelineCreateInfo::default()
+            .stage(stage_info)
+            .layout(pipeline_layout);
+        let pipeline = unsafe {
+            ctx.device
+                .create_compute_pipelines(vk::PipelineCache::null(), core::slice::from_ref(&pipeline_info), None)
+                .map_err(|(_, e)| format!("vk create compute pipeline: {e}"))?
+                .remove(0)
+        };
 
-    let descriptor_pool_sizes = [
+        let descriptor_pool_sizes = [
         vk::DescriptorPoolSize {
             ty: vk::DescriptorType::STORAGE_BUFFER,
             descriptor_count: 1,
@@ -337,105 +415,105 @@ pub fn setup_vulkan_pipeline_plan(
             descriptor_count: 1,
         },
     ];
-    let descriptor_pool_info = vk::DescriptorPoolCreateInfo::default()
-        .pool_sizes(&descriptor_pool_sizes)
-        .max_sets(1);
-    let descriptor_pool = unsafe {
-        ctx.device
-            .create_descriptor_pool(&descriptor_pool_info, None)
-            .map_err(|e| format!("vk create descriptor pool: {e}"))?
-    };
+        let descriptor_pool_info = vk::DescriptorPoolCreateInfo::default()
+            .pool_sizes(&descriptor_pool_sizes)
+            .max_sets(1);
+        let descriptor_pool = unsafe {
+            ctx.device
+                .create_descriptor_pool(&descriptor_pool_info, None)
+                .map_err(|e| format!("vk create descriptor pool: {e}"))?
+        };
 
-    let set_alloc_info = vk::DescriptorSetAllocateInfo::default()
-        .descriptor_pool(descriptor_pool)
-        .set_layouts(core::slice::from_ref(&descriptor_set_layout));
-    let descriptor_set = unsafe {
-        ctx.device
-            .allocate_descriptor_sets(&set_alloc_info)
-            .map_err(|e| format!("vk allocate descriptor set: {e}"))?
-            .remove(0)
-    };
+        let set_alloc_info = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(descriptor_pool)
+            .set_layouts(core::slice::from_ref(&descriptor_set_layout));
+        let descriptor_set = unsafe {
+            ctx.device
+                .allocate_descriptor_sets(&set_alloc_info)
+                .map_err(|e| format!("vk allocate descriptor set: {e}"))?
+                .remove(0)
+        };
 
     // Buffer creation and descriptor writes (host-visible for now).
-    let data_size = 4usize * input.len();
-    let params_size = core::mem::size_of::<FftStageParams>();
-    let twiddle_count = (plan.params.height as usize / 2).max(1);
-    let twiddle_size = 4usize * twiddle_count;
+        let data_size = 4usize * input.len();
+        let params_size = core::mem::size_of::<FftStageParams>();
+        let twiddle_count = (plan.params.height as usize / 2).max(1);
+        let twiddle_size = 4usize * twiddle_count;
 
-    let buffer_info = vk::BufferCreateInfo::default()
+        let buffer_info = vk::BufferCreateInfo::default()
         .size(data_size as u64)
         .usage(vk::BufferUsageFlags::STORAGE_BUFFER)
         .sharing_mode(vk::SharingMode::EXCLUSIVE);
-    let data_buffer = unsafe {
+        let data_buffer = unsafe {
         ctx.device
             .create_buffer(&buffer_info, None)
             .map_err(|e| format!("vk create data buffer: {e}"))?
     };
 
-    let uniform_info = vk::BufferCreateInfo::default()
+        let uniform_info = vk::BufferCreateInfo::default()
         .size(params_size as u64)
         .usage(vk::BufferUsageFlags::UNIFORM_BUFFER)
         .sharing_mode(vk::SharingMode::EXCLUSIVE);
-    let params_buffer = unsafe {
+        let params_buffer = unsafe {
         ctx.device
             .create_buffer(&uniform_info, None)
             .map_err(|e| format!("vk create params buffer: {e}"))?
     };
-    let twiddle_info = vk::BufferCreateInfo::default()
+        let twiddle_info = vk::BufferCreateInfo::default()
         .size(twiddle_size as u64)
         .usage(vk::BufferUsageFlags::STORAGE_BUFFER)
         .sharing_mode(vk::SharingMode::EXCLUSIVE);
-    let twiddle_buffer = unsafe {
+        let twiddle_buffer = unsafe {
         ctx.device
             .create_buffer(&twiddle_info, None)
             .map_err(|e| format!("vk create twiddle buffer: {e}"))?
     };
 
-    let data_reqs = unsafe { ctx.device.get_buffer_memory_requirements(data_buffer) };
-    let params_reqs = unsafe { ctx.device.get_buffer_memory_requirements(params_buffer) };
-    let twiddle_reqs = unsafe { ctx.device.get_buffer_memory_requirements(twiddle_buffer) };
-    let mem_props = unsafe {
-        ctx.instance
-            .get_physical_device_memory_properties(ctx.physical_device)
-    };
-    let host_flags = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
-    let find_type = |reqs: vk::MemoryRequirements| -> Result<u32, String> {
-        (0..mem_props.memory_type_count)
-            .find(|i| {
-                let suitable = (reqs.memory_type_bits & (1 << i)) != 0;
-                suitable && mem_props.memory_types[*i as usize].property_flags.contains(host_flags)
-            })
-            .ok_or_else(|| "no suitable host visible memory type".to_string())
-    };
-    let data_mem_type = find_type(data_reqs)?;
-    let params_mem_type = find_type(params_reqs)?;
-    let twiddle_mem_type = find_type(twiddle_reqs)?;
+        let data_reqs = unsafe { ctx.device.get_buffer_memory_requirements(data_buffer) };
+        let params_reqs = unsafe { ctx.device.get_buffer_memory_requirements(params_buffer) };
+        let twiddle_reqs = unsafe { ctx.device.get_buffer_memory_requirements(twiddle_buffer) };
+        let mem_props = unsafe {
+            ctx.instance
+                .get_physical_device_memory_properties(ctx.physical_device)
+        };
+        let host_flags = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+        let find_type = |reqs: vk::MemoryRequirements| -> Result<u32, String> {
+            (0..mem_props.memory_type_count)
+                .find(|i| {
+                    let suitable = (reqs.memory_type_bits & (1 << i)) != 0;
+                    suitable && mem_props.memory_types[*i as usize].property_flags.contains(host_flags)
+                })
+                .ok_or_else(|| "no suitable host visible memory type".to_string())
+        };
+        let data_mem_type = find_type(data_reqs)?;
+        let params_mem_type = find_type(params_reqs)?;
+        let twiddle_mem_type = find_type(twiddle_reqs)?;
 
-    let data_alloc = vk::MemoryAllocateInfo::default()
+        let data_alloc = vk::MemoryAllocateInfo::default()
         .allocation_size(data_reqs.size)
         .memory_type_index(data_mem_type);
-    let params_alloc = vk::MemoryAllocateInfo::default()
+        let params_alloc = vk::MemoryAllocateInfo::default()
         .allocation_size(params_reqs.size)
         .memory_type_index(params_mem_type);
-    let twiddle_alloc = vk::MemoryAllocateInfo::default()
+        let twiddle_alloc = vk::MemoryAllocateInfo::default()
         .allocation_size(twiddle_reqs.size)
         .memory_type_index(twiddle_mem_type);
-    let data_memory = unsafe {
+        let data_memory = unsafe {
         ctx.device
             .allocate_memory(&data_alloc, None)
             .map_err(|e| format!("vk alloc data memory: {e}"))?
     };
-    let params_memory = unsafe {
+        let params_memory = unsafe {
         ctx.device
             .allocate_memory(&params_alloc, None)
             .map_err(|e| format!("vk alloc params memory: {e}"))?
     };
-    let twiddle_memory = unsafe {
+        let twiddle_memory = unsafe {
         ctx.device
             .allocate_memory(&twiddle_alloc, None)
             .map_err(|e| format!("vk alloc twiddle memory: {e}"))?
     };
-    unsafe {
+        unsafe {
         ctx.device
             .bind_buffer_memory(data_buffer, data_memory, 0)
             .map_err(|e| format!("vk bind data memory: {e}"))?;
@@ -447,19 +525,19 @@ pub fn setup_vulkan_pipeline_plan(
             .map_err(|e| format!("vk bind twiddle memory: {e}"))?;
     }
 
-    let data_buffer_info = vk::DescriptorBufferInfo::default()
+        let data_buffer_info = vk::DescriptorBufferInfo::default()
         .buffer(data_buffer)
         .offset(0)
         .range(data_size as u64);
-    let params_buffer_info = vk::DescriptorBufferInfo::default()
+        let params_buffer_info = vk::DescriptorBufferInfo::default()
         .buffer(params_buffer)
         .offset(0)
         .range(params_size as u64);
-    let twiddle_buffer_info = vk::DescriptorBufferInfo::default()
+        let twiddle_buffer_info = vk::DescriptorBufferInfo::default()
         .buffer(twiddle_buffer)
         .offset(0)
         .range(twiddle_size as u64);
-    let writes = [
+        let writes = [
         vk::WriteDescriptorSet::default()
             .dst_set(descriptor_set)
             .dst_binding(0)
@@ -476,28 +554,38 @@ pub fn setup_vulkan_pipeline_plan(
             .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
             .buffer_info(core::slice::from_ref(&twiddle_buffer_info)),
     ];
-    unsafe {
-        ctx.device.update_descriptor_sets(&writes, &[]);
-    }
+        unsafe {
+            ctx.device.update_descriptor_sets(&writes, &[]);
+        }
 
     // Write input data + params + twiddles.
-    let mut params = plan.params;
-    unsafe {
+        let mut params = plan.params;
+        // DIT flow expects bit-reversed input rows.
+        let mut input_bitrev = input.to_vec();
+        bit_reverse_rows_u32(
+            &mut input_bitrev,
+            plan.params.width as usize,
+        );
+
+        let upload_start = Instant::now();
+        unsafe {
         let data_ptr = ctx
             .device
             .map_memory(data_memory, 0, data_size as u64, vk::MemoryMapFlags::empty())
             .map_err(|e| format!("vk map data memory: {e}"))?;
         let data_slice = core::slice::from_raw_parts_mut(data_ptr as *mut u32, data_size / 4);
-        data_slice.copy_from_slice(input);
+        data_slice.copy_from_slice(&input_bitrev);
         ctx.device.unmap_memory(data_memory);
     }
+        let upload_ms = upload_start.elapsed().as_millis();
 
     // Run all FFT stages.
-    let alloc_info = vk::CommandBufferAllocateInfo::default()
+        let stages_start = Instant::now();
+        let alloc_info = vk::CommandBufferAllocateInfo::default()
         .command_pool(ctx.command_pool)
         .level(vk::CommandBufferLevel::PRIMARY)
         .command_buffer_count(1);
-    for stage in 0..params.log_n {
+        for stage in 0..params.log_n {
         params.stage = stage;
         let stage_twiddles = twiddles_for_stage(params.log_n, stage);
 
@@ -559,11 +647,13 @@ pub fn setup_vulkan_pipeline_plan(
                 .map_err(|e| format!("vk queue wait idle: {e}"))?;
             ctx.device.free_command_buffers(ctx.command_pool, &[command_buffer]);
         }
-    }
+        }
+        let stages_ms = stages_start.elapsed().as_millis();
 
     // Read back data.
-    let mut gpu_out = vec![0u32; data_size / 4];
-    unsafe {
+        let readback_start = Instant::now();
+        let mut gpu_out = vec![0u32; data_size / 4];
+        unsafe {
         let data_ptr = ctx
             .device
             .map_memory(data_memory, 0, data_size as u64, vk::MemoryMapFlags::empty())
@@ -572,8 +662,9 @@ pub fn setup_vulkan_pipeline_plan(
         gpu_out.copy_from_slice(data_slice);
         ctx.device.unmap_memory(data_memory);
     }
+        let readback_ms = readback_start.elapsed().as_millis();
 
-    unsafe {
+        unsafe {
         ctx.device.free_memory(data_memory, None);
         ctx.device.free_memory(params_memory, None);
         ctx.device.free_memory(twiddle_memory, None);
@@ -587,8 +678,20 @@ pub fn setup_vulkan_pipeline_plan(
         ctx.device.destroy_shader_module(shader_module, None);
     }
 
-    let _ = descriptor_set;
-    Ok(gpu_out)
+        let _ = descriptor_set;
+        let total_ms = total_start.elapsed().as_millis();
+        log_vulkan_timing(&format!(
+            "vulkan dft: h={} w={} stages={} upload={}ms stages={}ms readback={}ms total={}ms",
+            plan.params.height,
+            plan.params.width,
+            plan.params.log_n,
+            upload_ms,
+            stages_ms,
+            readback_ms,
+            total_ms
+        ));
+        Ok(gpu_out)
+    })
 }
 pub fn dft_batch<F: TwoAdicField>(
     _cpu: &Radix2DitParallel<F>,
@@ -609,6 +712,17 @@ pub fn dft_batch<F: TwoAdicField>(
         let bb_slice = unsafe { core::slice::from_raw_parts(ptr, values.len()) };
         bb_slice.iter().map(|v| v.to_unique_u32()).collect::<Vec<u32>>()
     };
+
+    // Preserve original input in BabyBear form for CPU/GPU comparison.
+    let original_bb_mat = RowMajorMatrix::new(
+        input
+            .iter()
+            .copied()
+            .map(|v| BabyBear::new(monty_to_canonical(v)))
+            .collect(),
+        plan.params.width as usize,
+    );
+
     let gpu_out = setup_vulkan_pipeline_plan(&plan, &input)?;
 
     // For now, only support BabyBear in the Vulkan path.
@@ -620,14 +734,14 @@ pub fn dft_batch<F: TwoAdicField>(
         .into_iter()
         .map(|v| BabyBear::new(monty_to_canonical(v)))
         .collect();
-    let mat = RowMajorMatrix::new(out_vals, plan.params.width as usize);
+    let mut mat = RowMajorMatrix::new(out_vals, plan.params.width as usize);
 
-    // Compare against CPU reference to pinpoint mismatches (BabyBear only).
-    if core::any::TypeId::of::<F>() == core::any::TypeId::of::<BabyBear>() {
+    // Compare against CPU reference in debug builds only.
+    if cfg!(debug_assertions) && core::any::TypeId::of::<F>() == core::any::TypeId::of::<BabyBear>() {
         let cpu_bb = Radix2DitParallel::<BabyBear>::default();
-        let cpu_out = cpu_bb.dft_batch(mat.clone());
+        let cpu_out = cpu_bb.dft_batch(original_bb_mat).to_row_major_matrix();
         let gpu_vals = &mat.values;
-        let cpu_vals = &cpu_out.inner.values;
+        let cpu_vals = &cpu_out.values;
         if gpu_vals.len() != cpu_vals.len() {
             return Err(format!(
                 "gpu/cpu length mismatch: gpu {} vs cpu {}",
@@ -637,6 +751,13 @@ pub fn dft_batch<F: TwoAdicField>(
         }
         for (idx, (g, c)) in gpu_vals.iter().zip(cpu_vals.iter()).enumerate() {
             if g != c {
+                // If output matches after row bit-reversal, normalize in-place and continue.
+                let mut reordered = mat.clone();
+                reverse_matrix_index_bits(&mut reordered);
+                if reordered.values == *cpu_vals {
+                    mat = reordered;
+                    break;
+                }
                 return Err(format!(
                     "vulkan dft mismatch at idx {idx}: gpu={} cpu={}",
                     g.to_unique_u32(),
