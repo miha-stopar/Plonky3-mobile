@@ -1,4 +1,5 @@
 use core::borrow::Borrow;
+use std::time::Instant;
 
 use p3_air::{Air, AirBuilder, AirBuilderWithPublicValues, BaseAir};
 use p3_baby_bear::BabyBear;
@@ -14,6 +15,7 @@ use p3_matrix::dense::RowMajorMatrix;
 use p3_merkle_tree::MerkleTreeHidingMmcs;
 use p3_symmetric::{CompressionFunctionFromHasher, PaddingFreeSponge, SerializingHasher};
 use p3_uni_stark::{StarkConfig, prove, verify};
+use p3_dft::TwoAdicSubgroupDft;
 use rand::SeedableRng;
 use rand::rngs::SmallRng;
 
@@ -70,6 +72,103 @@ pub fn run_fib_air_zk() -> Result<String, String> {
         .map_err(|err| format!("{err:?}"))?;
 
     Ok(format!("fib_air zk ok (n={n}, x={x})"))
+}
+
+fn benchmark_input(height: usize, width: usize) -> RowMajorMatrix<Val> {
+    let values = (0..(height * width))
+        .map(|i| {
+            // Deterministic, non-trivial values in field range.
+            let v = ((i as u64).wrapping_mul(17).wrapping_add(3)) % 0x7800_0001;
+            Val::from_u64(v)
+        })
+        .collect();
+    RowMajorMatrix::new(values, width)
+}
+
+fn percentile_ms(mut samples: Vec<f64>, q: f64) -> f64 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let n = samples.len();
+    let idx = ((q * n as f64).ceil() as usize).saturating_sub(1).min(n - 1);
+    samples[idx]
+}
+
+pub fn run_dft_benchmark() -> Result<String, String> {
+    crate::backend_vulkan::is_vulkan_available()?;
+
+    let cpu = GpuDft::<Val>::with_backend(BackendKind::Cpu);
+    let vulkan = GpuDft::<Val>::with_backend(BackendKind::Vulkan);
+    let cases = [
+        (256usize, 8usize),
+        (1024, 8),
+        (4096, 8),
+        (16384, 8),
+        (4096, 32),
+        (16384, 32),
+    ];
+    let warmup = 1usize;
+    let repeats = 10usize;
+
+    let mut lines = vec![format!(
+        "dft benchmark (repeats={repeats}, warmup={warmup}, stats=avg/median/p95)"
+    )];
+
+    for &(height, width) in &cases {
+        let input = benchmark_input(height, width);
+        let _ = crate::gpu_dft::take_last_vulkan_error();
+        for _ in 0..warmup {
+            let _ = cpu.dft_batch(input.clone());
+            let _ = vulkan.dft_batch(input.clone());
+        }
+
+        let mut cpu_samples_ms = Vec::with_capacity(repeats);
+        let mut cpu_out = None;
+        for _ in 0..repeats {
+            let start = Instant::now();
+            cpu_out = Some(cpu.dft_batch(input.clone()));
+            cpu_samples_ms.push(start.elapsed().as_secs_f64() * 1000.0);
+        }
+        let cpu_avg_ms = cpu_samples_ms.iter().copied().sum::<f64>() / repeats as f64;
+        let cpu_med_ms = percentile_ms(cpu_samples_ms.clone(), 0.50);
+        let cpu_p95_ms = percentile_ms(cpu_samples_ms, 0.95);
+
+        let mut vk_samples_ms = Vec::with_capacity(repeats);
+        let mut vk_out = None;
+        for _ in 0..repeats {
+            let start = Instant::now();
+            vk_out = Some(vulkan.dft_batch(input.clone()));
+            vk_samples_ms.push(start.elapsed().as_secs_f64() * 1000.0);
+        }
+        let vk_avg_ms = vk_samples_ms.iter().copied().sum::<f64>() / repeats as f64;
+        let vk_med_ms = percentile_ms(vk_samples_ms.clone(), 0.50);
+        let vk_p95_ms = percentile_ms(vk_samples_ms, 0.95);
+
+        if let Some(err) = crate::gpu_dft::take_last_vulkan_error() {
+            return Err(format!(
+                "vulkan benchmark fallback at h={height}, w={width}: {err}"
+            ));
+        }
+
+        let cpu_out = cpu_out.ok_or_else(|| "cpu benchmark output missing".to_string())?;
+        let vk_out = vk_out.ok_or_else(|| "vulkan benchmark output missing".to_string())?;
+        if cpu_out.values != vk_out.values {
+            return Err(format!("dft benchmark mismatch at h={height}, w={width}"));
+        }
+
+        let speedup_avg = if vk_avg_ms > 0.0 {
+            cpu_avg_ms / vk_avg_ms
+        } else {
+            0.0
+        };
+        lines.push(format!(
+            "h={height}, w={width}: cpu(avg={cpu_avg_ms:.3} med={cpu_med_ms:.3} p95={cpu_p95_ms:.3})ms \
+vk(avg={vk_avg_ms:.3} med={vk_med_ms:.3} p95={vk_p95_ms:.3})ms speedup(avg)={speedup_avg:.2}x"
+        ));
+    }
+
+    Ok(lines.join("\n"))
 }
 
 pub struct FibonacciAir {}

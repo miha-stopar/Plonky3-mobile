@@ -85,6 +85,52 @@ pub extern "system" fn Java_com_plonky3_android_MainActivity_runFibAirZk(
 }
 
 #[no_mangle]
+pub extern "system" fn Java_com_plonky3_android_MainActivity_runDftBenchmark(
+    mut env: JNIEnv,
+    _class: JClass,
+) -> jstring {
+    let message = {
+        #[cfg(feature = "plonky3")]
+        {
+            let run = std::panic::catch_unwind(|| fib_air::run_dft_benchmark());
+            let result = match run {
+                Ok(Ok(value)) => value,
+                Ok(Err(err)) => format!("dft benchmark failed: {err}"),
+                Err(payload) => {
+                    let msg = if let Some(s) = payload.downcast_ref::<&str>() {
+                        (*s).to_string()
+                    } else if let Some(s) = payload.downcast_ref::<String>() {
+                        s.clone()
+                    } else {
+                        "unknown panic".to_string()
+                    };
+                    format!("dft benchmark panicked: {msg}")
+                }
+            };
+            #[cfg(target_os = "android")]
+            {
+                let prio = if result.contains("failed") || result.contains("panicked") {
+                    ANDROID_LOG_ERROR
+                } else {
+                    ANDROID_LOG_INFO
+                };
+                log_android(prio, &result);
+            }
+            result
+        }
+        #[cfg(not(feature = "plonky3"))]
+        {
+            "plonky3 feature disabled in native build".to_string()
+        }
+    };
+
+    match env.new_string(message) {
+        Ok(value) => value.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+#[no_mangle]
 pub extern "system" fn Java_com_plonky3_android_MainActivity_setBackend(
     mut env: JNIEnv,
     _class: JClass,
