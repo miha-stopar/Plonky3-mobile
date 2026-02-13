@@ -81,7 +81,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let a = data[idx0];
     let b = data[idx1];
 
-    let twiddle = twiddles[offset];
+    let twiddle = twiddles[params.twiddle_base + offset];
     let t = mul_mod(b, twiddle);
 
     data[idx0] = add_mod(a, t);

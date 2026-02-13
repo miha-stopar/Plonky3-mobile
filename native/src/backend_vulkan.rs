@@ -239,11 +239,11 @@ impl VulkanRuntime {
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
         let params_buffer_info = vk::BufferCreateInfo::default()
             .size(params_size as u64)
-            .usage(vk::BufferUsageFlags::UNIFORM_BUFFER)
+            .usage(vk::BufferUsageFlags::UNIFORM_BUFFER | vk::BufferUsageFlags::TRANSFER_DST)
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
         let twiddle_buffer_info = vk::BufferCreateInfo::default()
             .size(twiddle_size as u64)
-            .usage(vk::BufferUsageFlags::STORAGE_BUFFER)
+            .usage(vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST)
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
 
         let data_buffer = unsafe {
@@ -634,6 +634,16 @@ fn twiddles_for_stage(log_n: u32, stage: u32) -> Vec<u32> {
         .collect()
 }
 
+fn twiddle_table(log_n: u32) -> (Vec<u32>, Vec<u32>) {
+    let mut all = Vec::new();
+    let mut stage_base = Vec::with_capacity(log_n as usize);
+    for stage in 0..log_n {
+        stage_base.push(all.len() as u32);
+        all.extend(twiddles_for_stage(log_n, stage));
+    }
+    (all, stage_base)
+}
+
 fn reverse_bits_len_usize(mut x: usize, bits: usize) -> usize {
     let mut y = 0usize;
     for _ in 0..bits {
@@ -671,8 +681,8 @@ pub fn setup_vulkan_pipeline_plan(
         runtime.ensure_pipeline()?;
         let params_size = core::mem::size_of::<FftStageParams>();
         let data_size = 4usize * input.len();
-        let twiddle_count = (plan.params.height as usize / 2).max(1);
-        let twiddle_size = 4usize * twiddle_count;
+        let twiddle_total_count = ((plan.params.height as usize).saturating_sub(1)).max(1);
+        let twiddle_size = 4usize * twiddle_total_count;
         runtime.ensure_io(data_size, params_size, twiddle_size)?;
         let ctx = &runtime.ctx;
         let pipeline_state = runtime
@@ -687,7 +697,6 @@ pub fn setup_vulkan_pipeline_plan(
             .ok_or_else(|| "vulkan IO cache unexpectedly empty".to_string())?;
         let descriptor_set = io_state.descriptor_set;
         let data_memory = io_state.data_memory;
-        let params_memory = io_state.params_memory;
         let twiddle_memory = io_state.twiddle_memory;
 
         // Write input data + params + twiddles.
@@ -695,6 +704,7 @@ pub fn setup_vulkan_pipeline_plan(
         // DIT flow expects bit-reversed input rows.
         let mut input_bitrev = input.to_vec();
         bit_reverse_rows_u32(&mut input_bitrev, plan.params.width as usize);
+        let (twiddles_all, twiddle_stage_base) = twiddle_table(params.log_n);
 
         let upload_start = Instant::now();
         unsafe {
@@ -705,6 +715,18 @@ pub fn setup_vulkan_pipeline_plan(
             let data_slice = core::slice::from_raw_parts_mut(data_ptr as *mut u32, data_size / 4);
             data_slice.copy_from_slice(&input_bitrev);
             ctx.device.unmap_memory(data_memory);
+
+            let twiddle_ptr = ctx
+                .device
+                .map_memory(twiddle_memory, 0, twiddle_size as u64, vk::MemoryMapFlags::empty())
+                .map_err(|e| format!("vk map twiddle memory: {e}"))?;
+            let twiddle_slice =
+                core::slice::from_raw_parts_mut(twiddle_ptr as *mut u32, twiddle_total_count);
+            twiddle_slice[..twiddles_all.len()].copy_from_slice(&twiddles_all);
+            if twiddles_all.len() < twiddle_total_count {
+                twiddle_slice[twiddles_all.len()..].fill(0);
+            }
+            ctx.device.unmap_memory(twiddle_memory);
         }
         let upload_ms = upload_start.elapsed().as_millis();
 
@@ -714,71 +736,113 @@ pub fn setup_vulkan_pipeline_plan(
             .command_pool(ctx.command_pool)
             .level(vk::CommandBufferLevel::PRIMARY)
             .command_buffer_count(1);
+        let command_buffer = unsafe {
+            ctx.device
+                .allocate_command_buffers(&alloc_info)
+                .map_err(|e| format!("vk allocate command buffer: {e}"))?
+                .remove(0)
+        };
+        let begin_info = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+
+        unsafe {
+            ctx.device
+                .begin_command_buffer(command_buffer, &begin_info)
+                .map_err(|e| format!("vk begin command buffer: {e}"))?;
+            ctx.device
+                .cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::COMPUTE, pipeline);
+            ctx.device.cmd_bind_descriptor_sets(
+                command_buffer,
+                vk::PipelineBindPoint::COMPUTE,
+                pipeline_layout,
+                0,
+                core::slice::from_ref(&descriptor_set),
+                &[],
+            );
+        }
+
         for stage in 0..params.log_n {
             params.stage = stage;
-            let stage_twiddles = twiddles_for_stage(params.log_n, stage);
-
-            unsafe {
-                let params_ptr = ctx
-                    .device
-                    .map_memory(params_memory, 0, params_size as u64, vk::MemoryMapFlags::empty())
-                    .map_err(|e| format!("vk map params memory: {e}"))?;
-                let params_slice =
-                    core::slice::from_raw_parts_mut(params_ptr as *mut FftStageParams, 1);
-                params_slice[0] = params;
-                ctx.device.unmap_memory(params_memory);
-
-                let twiddle_ptr = ctx
-                    .device
-                    .map_memory(twiddle_memory, 0, twiddle_size as u64, vk::MemoryMapFlags::empty())
-                    .map_err(|e| format!("vk map twiddle memory: {e}"))?;
-                let twiddle_slice =
-                    core::slice::from_raw_parts_mut(twiddle_ptr as *mut u32, twiddle_count);
-                twiddle_slice[..stage_twiddles.len()].copy_from_slice(&stage_twiddles);
-                ctx.device.unmap_memory(twiddle_memory);
-            }
-
-            let command_buffer = unsafe {
-                ctx.device
-                    .allocate_command_buffers(&alloc_info)
-                    .map_err(|e| format!("vk allocate command buffer: {e}"))?
-                    .remove(0)
+            params.twiddle_base = twiddle_stage_base[stage as usize];
+            let params_words = [
+                params.width,
+                params.height,
+                params.stage,
+                params.log_n,
+                params.twiddle_base,
+                params._pad0,
+                params._pad1,
+                params._pad2,
+            ];
+            let params_bytes = unsafe {
+                core::slice::from_raw_parts(
+                    params_words.as_ptr() as *const u8,
+                    core::mem::size_of_val(&params_words),
+                )
             };
-            let begin_info = vk::CommandBufferBeginInfo::default()
-                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            let params_barrier = vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::UNIFORM_READ)
+                .buffer(io_state.params_buffer)
+                .offset(0)
+                .size(params_size as u64);
+
             unsafe {
                 ctx.device
-                    .begin_command_buffer(command_buffer, &begin_info)
-                    .map_err(|e| format!("vk begin command buffer: {e}"))?;
-                ctx.device
-                    .cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::COMPUTE, pipeline);
-                ctx.device.cmd_bind_descriptor_sets(
+                    .cmd_update_buffer(command_buffer, io_state.params_buffer, 0, params_bytes);
+                ctx.device.cmd_pipeline_barrier(
                     command_buffer,
-                    vk::PipelineBindPoint::COMPUTE,
-                    pipeline_layout,
-                    0,
-                    core::slice::from_ref(&descriptor_set),
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    core::slice::from_ref(&params_barrier),
                     &[],
                 );
                 let dispatch = dispatch_dims(&params);
                 ctx.device
                     .cmd_dispatch(command_buffer, dispatch.0, dispatch.1, dispatch.2);
-                ctx.device
-                    .end_command_buffer(command_buffer)
-                    .map_err(|e| format!("vk end command buffer: {e}"))?;
             }
 
-            let submit_info =
-                vk::SubmitInfo::default().command_buffers(core::slice::from_ref(&command_buffer));
-            unsafe {
-                ctx.device
-                    .queue_submit(ctx.queue, core::slice::from_ref(&submit_info), vk::Fence::null())
-                    .map_err(|e| format!("vk queue submit: {e}"))?;
-                ctx.device
-                    .queue_wait_idle(ctx.queue)
-                    .map_err(|e| format!("vk queue wait idle: {e}"))?;
-                ctx.device.free_command_buffers(ctx.command_pool, &[command_buffer]);
+            if stage + 1 < params.log_n {
+                let stage_barrier = vk::BufferMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                    .dst_access_mask(
+                        vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+                    )
+                    .buffer(io_state.data_buffer)
+                    .offset(0)
+                    .size(data_size as u64);
+                unsafe {
+                    ctx.device.cmd_pipeline_barrier(
+                        command_buffer,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        vk::DependencyFlags::empty(),
+                        &[],
+                        core::slice::from_ref(&stage_barrier),
+                        &[],
+                    );
+                }
             }
+        }
+        unsafe {
+            ctx.device
+                .end_command_buffer(command_buffer)
+                .map_err(|e| format!("vk end command buffer: {e}"))?;
+        }
+        let submit_info =
+            vk::SubmitInfo::default().command_buffers(core::slice::from_ref(&command_buffer));
+        unsafe {
+            ctx.device
+                .queue_submit(ctx.queue, core::slice::from_ref(&submit_info), vk::Fence::null())
+                .map_err(|e| format!("vk queue submit: {e}"))?;
+            ctx.device
+                .queue_wait_idle(ctx.queue)
+                .map_err(|e| format!("vk queue wait idle: {e}"))?;
+        }
+        unsafe {
+            ctx.device.free_command_buffers(ctx.command_pool, &[command_buffer]);
         }
         let stages_ms = stages_start.elapsed().as_millis();
 

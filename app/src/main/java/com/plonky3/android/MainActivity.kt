@@ -3,6 +3,8 @@ package com.plonky3.android
 import android.os.Bundle
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
 
 class MainActivity : AppCompatActivity() {
     companion object {
@@ -15,24 +17,36 @@ class MainActivity : AppCompatActivity() {
     private external fun runDftBenchmark(): String
     private external fun setBackend(backend: String)
     private external fun isVulkanAvailable(): String
+    private val worker: ExecutorService = Executors.newSingleThreadExecutor()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
         val status = findViewById<TextView>(R.id.status)
+        status.text = "Running benchmark..."
 
-        val output = try {
-            setBackend("vulkan")
-            val vkStatus = isVulkanAvailable()
-            val result = runFibAirZk()
-            val benchmark = runDftBenchmark()
-            "$vkStatus\n$result\n\n$benchmark"
-        } catch (e: UnsatisfiedLinkError) {
-            status.text = "Native library not loaded: ${e.message}"
-            return
+        worker.execute {
+            val output = try {
+                setBackend("vulkan")
+                val vkStatus = isVulkanAvailable()
+                val result = runFibAirZk()
+                val benchmark = runDftBenchmark()
+                "$vkStatus\n$result\n\n$benchmark"
+            } catch (e: UnsatisfiedLinkError) {
+                "Native library not loaded: ${e.message}"
+            } catch (e: Throwable) {
+                "Benchmark failed: ${e.message}"
+            }
+
+            runOnUiThread {
+                status.text = output
+            }
         }
+    }
 
-        status.text = output
+    override fun onDestroy() {
+        worker.shutdownNow()
+        super.onDestroy()
     }
 }
