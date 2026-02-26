@@ -46,6 +46,8 @@ struct VulkanContext {
     queue: vk::Queue,
     queue_family_index: u32,
     command_pool: vk::CommandPool,
+    timestamp_period_ns: f32,
+    timestamp_supported: bool,
 }
 
 struct VulkanPipelineState {
@@ -82,6 +84,8 @@ struct VulkanRuntime {
     io: Option<VulkanIoState>,
     command_buffer: Option<vk::CommandBuffer>,
     submit_fence: Option<vk::Fence>,
+    timestamp_query_pool: Option<vk::QueryPool>,
+    timestamp_log_emitted: bool,
 }
 
 thread_local! {
@@ -98,6 +102,8 @@ fn with_vulkan_runtime<T>(f: impl FnOnce(&mut VulkanRuntime) -> Result<T, String
                 io: None,
                 command_buffer: None,
                 submit_fence: None,
+                timestamp_query_pool: None,
+                timestamp_log_emitted: false,
             });
         }
         let mut guard = cached.borrow_mut();
@@ -203,6 +209,31 @@ impl VulkanRuntime {
             pipeline_layout,
             pipeline,
         });
+        Ok(())
+    }
+
+    fn ensure_timestamps(&mut self) -> Result<(), String> {
+        if !self.ctx.timestamp_supported {
+            if !self.timestamp_log_emitted {
+                log_vulkan_timing("vulkan timing: timestamps unsupported on this queue/device");
+                self.timestamp_log_emitted = true;
+            }
+            return Ok(());
+        }
+        if self.timestamp_query_pool.is_some() {
+            return Ok(());
+        }
+        let info = vk::QueryPoolCreateInfo::default()
+            .query_type(vk::QueryType::TIMESTAMP)
+            .query_count(4);
+        let pool = unsafe {
+            self.ctx
+                .device
+                .create_query_pool(&info, None)
+                .map_err(|e| format!("vk create timestamp query pool: {e}"))?
+        };
+        self.timestamp_query_pool = Some(pool);
+        log_vulkan_timing("vulkan timing: timestamp query pool created");
         Ok(())
     }
 
@@ -569,6 +600,20 @@ impl VulkanContext {
                 .map_err(|e| format!("vk create command pool: {e}"))?
         };
 
+        let dev_props = unsafe { instance.get_physical_device_properties(physical_device) };
+        let queue_props =
+            unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
+        let queue_timestamp_bits = queue_props[queue_family_index as usize].timestamp_valid_bits;
+        // Some mobile drivers report timestamp_compute_and_graphics=0 while still
+        // supporting queue timestamps for compute. Gate on queue timestamp bits.
+        let timestamp_supported = queue_timestamp_bits > 0;
+        log_vulkan_timing(&format!(
+            "vulkan timing init: queue_family={} timestamp_valid_bits={} timestamp_period_ns={:.3} supported={}",
+            queue_family_index,
+            queue_timestamp_bits,
+            dev_props.limits.timestamp_period,
+            timestamp_supported
+        ));
         Ok(Self {
             entry,
             instance,
@@ -577,6 +622,8 @@ impl VulkanContext {
             queue,
             queue_family_index,
             command_pool,
+            timestamp_period_ns: dev_props.limits.timestamp_period,
+            timestamp_supported,
         })
     }
 }
@@ -590,6 +637,11 @@ pub fn is_vulkan_available() -> Result<(), String> {
 
 impl Drop for VulkanRuntime {
     fn drop(&mut self) {
+        if let Some(pool) = self.timestamp_query_pool.take() {
+            unsafe {
+                self.ctx.device.destroy_query_pool(pool, None);
+            }
+        }
         if let Some(fence) = self.submit_fence.take() {
             unsafe {
                 self.ctx.device.destroy_fence(fence, None);
@@ -664,18 +716,21 @@ pub fn dispatch_dims(params: &FftStageParams) -> (u32, u32, u32) {
     // - gid.y maps to `j`   (butterfly lane index for this stage)
     // - gid.z is unused (kept at 1)
     //
-    // Shader workgroup size is 64x1x1. To cover `width` columns, we dispatch
-    // ceil(width / 64) workgroups in X.
-    // Any tail lanes in the final workgroup can still early-exit with:
+    // Shader workgroup size is 8x8x1.
+    // To cover `width` columns, dispatch ceil(width / 8) workgroups in X.
+    // To cover butterfly lanes `j`, dispatch ceil((height/2) / 8) workgroups in Y.
+    // Any tail lanes in final workgroups can still early-exit with:
     //   if (col >= params.width) return;
     // See shader comments for details.
     //
     // j spans up to height/2 lanes for each stage.
     let j_count = (params.height.max(1)) / 2;
     let width = params.width.max(1);
-    let workgroup_x = 64u32;
+    let workgroup_x = 8u32;
+    let workgroup_y = 8u32;
     let x = width.div_ceil(workgroup_x);
-    (x, j_count.max(1), 1)
+    let y = j_count.max(1).div_ceil(workgroup_y);
+    (x, y, 1)
 }
 
 pub fn cpu_stage_u32_in_place(data: &mut [u32], params: FftStageParams, twiddles: &[u32]) {
@@ -797,6 +852,12 @@ fn twiddle_table(log_n: u32) -> (Vec<u32>, Vec<u32>) {
     (all, stage_base)
 }
 
+fn twiddle_stage_base_table(log_n: u32) -> Vec<u32> {
+    // Stage s uses 2^s twiddles, so the packed base offset is:
+    // base[s] = sum_{k=0..s-1} 2^k = 2^s - 1.
+    (0..log_n).map(|s| (1u32 << s) - 1).collect()
+}
+
 fn reverse_bits_len_usize(mut x: usize, bits: usize) -> usize {
     let mut y = 0usize;
     for _ in 0..bits {
@@ -806,22 +867,24 @@ fn reverse_bits_len_usize(mut x: usize, bits: usize) -> usize {
     y
 }
 
-fn bit_reverse_rows_u32(values: &mut [u32], width: usize) {
-    if width == 0 || values.is_empty() {
+fn write_bit_reversed_rows_u32(dst: &mut [u32], src: &[u32], width: usize) {
+    if width == 0 || src.is_empty() {
         return;
     }
-    let height = values.len() / width;
-    if height <= 1 || !height.is_power_of_two() {
+    let height = src.len() / width;
+    if height == 0 {
+        return;
+    }
+    if !height.is_power_of_two() {
+        dst.copy_from_slice(src);
         return;
     }
     let bits = height.trailing_zeros() as usize;
-    for i in 0..height {
-        let j = reverse_bits_len_usize(i, bits);
-        if j > i {
-            for col in 0..width {
-                values.swap(i * width + col, j * width + col);
-            }
-        }
+    for row in 0..height {
+        let src_row = reverse_bits_len_usize(row, bits);
+        let dst_off = row * width;
+        let src_off = src_row * width;
+        dst[dst_off..dst_off + width].copy_from_slice(&src[src_off..src_off + width]);
     }
 }
 
@@ -850,6 +913,7 @@ pub fn setup_vulkan_pipeline_plan(
     with_vulkan_runtime(|runtime| {
         runtime.ensure_pipeline()?;
         runtime.ensure_exec_state()?;
+        runtime.ensure_timestamps()?;
         let data_size = 4usize * input.len();
         let twiddle_total_count = ((plan.params.height as usize).saturating_sub(1)).max(1);
         let twiddle_size = 4usize * twiddle_total_count;
@@ -873,19 +937,21 @@ pub fn setup_vulkan_pipeline_plan(
             .submit_fence
             .ok_or_else(|| "vulkan submit fence cache unexpectedly empty".to_string())?;
 
-        // Prepare input for DIT: row bit-reversal, then write to upload staging.
+        // Prepare input for DIT directly into upload staging (avoid temporary vec allocation).
         let mut params = plan.params;
-        let mut input_bitrev = input.to_vec();
-        bit_reverse_rows_u32(&mut input_bitrev, plan.params.width as usize);
-        let (twiddles_all, twiddle_stage_base) = twiddle_table(params.log_n);
+        // Stage base offsets are needed for every call; cheap to compute from log_n.
+        let twiddle_stage_base = twiddle_stage_base_table(params.log_n);
 
         let upload_start = Instant::now();
         let twiddles_updated = io_state.twiddle_uploaded_log_n != Some(params.log_n);
+        let timestamp_pool = runtime.timestamp_query_pool;
         unsafe {
             let upload_slice = core::slice::from_raw_parts_mut(io_state.staging_upload_ptr, data_size / 4);
-            upload_slice.copy_from_slice(&input_bitrev);
+            write_bit_reversed_rows_u32(upload_slice, input, plan.params.width as usize);
 
             if twiddles_updated {
+                // Build+upload packed twiddles only when log_n changes.
+                let (twiddles_all, _) = twiddle_table(params.log_n);
                 let twiddle_slice =
                     core::slice::from_raw_parts_mut(io_state.twiddle_ptr, twiddle_total_count);
                 twiddle_slice[..twiddles_all.len()].copy_from_slice(&twiddles_all);
@@ -903,6 +969,7 @@ pub fn setup_vulkan_pipeline_plan(
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
 
         unsafe {
+            // Step 1: reset reusable execution objects for this call.
             ctx.device
                 .reset_fences(&[submit_fence])
                 .map_err(|e| format!("vk reset fence: {e}"))?;
@@ -912,6 +979,16 @@ pub fn setup_vulkan_pipeline_plan(
             ctx.device
                 .begin_command_buffer(command_buffer, &begin_info)
                 .map_err(|e| format!("vk begin command buffer: {e}"))?;
+            if let Some(pool) = timestamp_pool {
+                ctx.device.cmd_reset_query_pool(command_buffer, pool, 0, 4);
+                ctx.device.cmd_write_timestamp(
+                    command_buffer,
+                    vk::PipelineStageFlags::TOP_OF_PIPE,
+                    pool,
+                    0,
+                );
+            }
+            // Step 2: host->transfer/compute visibility for newly written staging/twiddles.
             let upload_host_barrier = vk::BufferMemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::HOST_WRITE)
                 .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
@@ -939,6 +1016,7 @@ pub fn setup_vulkan_pipeline_plan(
                 &host_barriers,
                 &[],
             );
+            // Step 3: copy CPU-uploaded input into main GPU compute buffer.
             let upload_copy = vk::BufferCopy::default().size(data_size as u64);
             ctx.device.cmd_copy_buffer(
                 command_buffer,
@@ -946,6 +1024,7 @@ pub fn setup_vulkan_pipeline_plan(
                 io_state.data_buffer,
                 core::slice::from_ref(&upload_copy),
             );
+            // Step 4: make transfer writes visible to compute shader stages.
             let data_upload_barrier = vk::BufferMemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
                 .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
@@ -961,6 +1040,7 @@ pub fn setup_vulkan_pipeline_plan(
                 core::slice::from_ref(&data_upload_barrier),
                 &[],
             );
+            // Step 5: bind compute pipeline + descriptor set (data buffer + twiddles).
             ctx.device
                 .cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::COMPUTE, pipeline);
             ctx.device.cmd_bind_descriptor_sets(
@@ -974,9 +1054,23 @@ pub fn setup_vulkan_pipeline_plan(
         }
 
         for stage in 0..params.log_n {
-            // This dispatch executes one butterfly stage across every column.
+            // Stage context (DIT radix-2 on each column independently):
+            // - stage 0 uses pair distance 1 (size-2 butterflies)
+            // - stage 1 uses pair distance 2 (size-4 butterflies)
+            // - ...
+            // - stage s uses pair distance 2^s and combines size-2^s blocks into size-2^(s+1)
+            //
+            // All columns are processed in parallel in the same dispatch:
+            // each shader invocation handles one (col, j) pair.
+            // col chooses which column, j chooses which butterfly lane in that stage.
             params.stage = stage;
             params.twiddle_base = twiddle_stage_base[stage as usize];
+            // Packed values pushed to shader for this stage:
+            // [width, height, stage, log_n, twiddle_base, pad, pad, pad]
+            //
+            // - width/height identify matrix shape (height x width).
+            // - stage selects butterfly geometry (m, half) inside shader.
+            // - twiddle_base points to this stage's twiddle segment.
             let params_words = [
                 params.width,
                 params.height,
@@ -994,6 +1088,9 @@ pub fn setup_vulkan_pipeline_plan(
                 )
             };
             unsafe {
+                // Update shader-visible stage parameters for *this* dispatch only.
+                // Push constants are small command-stream values, not global constants.
+                // They are replaced each stage before cmd_dispatch.
                 ctx.device.cmd_push_constants(
                     command_buffer,
                     pipeline_layout,
@@ -1002,11 +1099,17 @@ pub fn setup_vulkan_pipeline_plan(
                     params_bytes,
                 );
                 let dispatch = dispatch_dims(&params);
+                // Launch grid:
+                // - X covers columns in groups of 8 threads  (workgroup_size x = 8)
+                // - Y covers butterfly lanes in groups of 8 (workgroup_size y = 8)
+                // - Z is unused (=1)
                 ctx.device
                     .cmd_dispatch(command_buffer, dispatch.0, dispatch.1, dispatch.2);
             }
 
             if stage + 1 < params.log_n {
+                // Step 6: stage-to-stage dependency within data_buffer.
+                // Next stage reads values produced by this stage.
                 let stage_barrier = vk::BufferMemoryBarrier::default()
                     .src_access_mask(vk::AccessFlags::SHADER_WRITE)
                     .dst_access_mask(
@@ -1029,6 +1132,15 @@ pub fn setup_vulkan_pipeline_plan(
             }
         }
         unsafe {
+            if let Some(pool) = timestamp_pool {
+                ctx.device.cmd_write_timestamp(
+                    command_buffer,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    pool,
+                    1,
+                );
+            }
+            // Step 7: final compute->transfer visibility before readback copy.
             let pre_copy_readback_barrier = vk::BufferMemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::SHADER_WRITE)
                 .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
@@ -1044,6 +1156,7 @@ pub fn setup_vulkan_pipeline_plan(
                 core::slice::from_ref(&pre_copy_readback_barrier),
                 &[],
             );
+            // Step 8: copy final GPU results into CPU-readable readback staging.
             let readback_copy = vk::BufferCopy::default().size(data_size as u64);
             ctx.device.cmd_copy_buffer(
                 command_buffer,
@@ -1051,8 +1164,17 @@ pub fn setup_vulkan_pipeline_plan(
                 io_state.staging_readback_buffer,
                 core::slice::from_ref(&readback_copy),
             );
+            if let Some(pool) = timestamp_pool {
+                ctx.device.cmd_write_timestamp(
+                    command_buffer,
+                    vk::PipelineStageFlags::TRANSFER,
+                    pool,
+                    2,
+                );
+            }
         }
         unsafe {
+            // Step 9: submit recorded commands and wait for completion of this DFT call.
             ctx.device
                 .end_command_buffer(command_buffer)
                 .map_err(|e| format!("vk end command buffer: {e}"))?;
@@ -1066,6 +1188,38 @@ pub fn setup_vulkan_pipeline_plan(
             ctx.device
                 .wait_for_fences(&[submit_fence], true, u64::MAX)
                 .map_err(|e| format!("vk wait for fence: {e}"))?;
+        }
+        let mut gpu_timing_ms = None;
+        if let Some(pool) = timestamp_pool {
+            // Avoid blocking here; some mobile drivers can stall with WAIT despite
+            // fence completion. If results are not ready, we skip GPU timing for
+            // this call and keep functional behavior unchanged.
+            let mut queries = [0u64; 6];
+            unsafe {
+                let query_res = ctx.device.get_query_pool_results(
+                    pool,
+                    0,
+                    &mut queries,
+                    vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WITH_AVAILABILITY,
+                );
+                if let Err(err) = query_res {
+                    if err != vk::Result::NOT_READY {
+                        return Err(format!("vk get timestamp query results: {err}"));
+                    }
+                }
+            }
+            let all_ready = queries[1] != 0 && queries[3] != 0 && queries[5] != 0;
+            if all_ready {
+                let period_ns = ctx.timestamp_period_ns as f64;
+                let q0 = queries[0] as f64;
+                let q1 = queries[2] as f64;
+                let q2 = queries[4] as f64;
+                gpu_timing_ms = Some((
+                    ((q1 - q0) * period_ns) / 1_000_000.0,
+                    ((q2 - q1) * period_ns) / 1_000_000.0,
+                    ((q2 - q0) * period_ns) / 1_000_000.0,
+                ));
+            }
         }
         let stages_ms = stages_start.elapsed().as_millis();
 
@@ -1081,16 +1235,32 @@ pub fn setup_vulkan_pipeline_plan(
 
         let _ = descriptor_set;
         let total_ms = total_start.elapsed().as_millis();
-        log_vulkan_timing(&format!(
-            "vulkan dft: h={} w={} stages={} upload={}ms stages={}ms readback={}ms total={}ms",
-            plan.params.height,
-            plan.params.width,
-            plan.params.log_n,
-            upload_ms,
-            stages_ms,
-            readback_ms,
-            total_ms
-        ));
+        if let Some((gpu_stage_ms, gpu_readback_ms, gpu_total_ms)) = gpu_timing_ms {
+            log_vulkan_timing(&format!(
+                "vulkan dft: h={} w={} stages={} upload={}ms stages={}ms readback={}ms total={}ms gpu(stage={:.3}ms copy_back={:.3}ms total={:.3}ms)",
+                plan.params.height,
+                plan.params.width,
+                plan.params.log_n,
+                upload_ms,
+                stages_ms,
+                readback_ms,
+                total_ms,
+                gpu_stage_ms,
+                gpu_readback_ms,
+                gpu_total_ms
+            ));
+        } else {
+            log_vulkan_timing(&format!(
+                "vulkan dft: h={} w={} stages={} upload={}ms stages={}ms readback={}ms total={}ms",
+                plan.params.height,
+                plan.params.width,
+                plan.params.log_n,
+                upload_ms,
+                stages_ms,
+                readback_ms,
+                total_ms
+            ));
+        }
         Ok(gpu_out)
     })
 }

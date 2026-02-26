@@ -64,7 +64,10 @@ fn mul_mod(a: u32, b: u32) -> u32 {
     return monty_reduce(prod);
 }
 
-@compute @workgroup_size(64)
+// 8x8 = 64 threads per workgroup.
+// Using 2D workgroups keeps lanes better utilized for narrow widths (e.g. w=8/32),
+// compared to 64x1 where most X lanes can be idle.
+@compute @workgroup_size(8, 8, 1)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // One invocation handles exactly one butterfly lane for one column:
     //   (col, j) = (gid.x, gid.y)
@@ -92,6 +95,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let height = params.height;
 
     // Map j to one butterfly pair within a block of size m.
+    // For each column, stage operates "vertically" over rows only:
+    // row index pair = (base, base + half), with the same `col`.
     let block = j / half;
     let offset = j % half;
     let base = block * m + offset;
@@ -105,7 +110,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx0 = base * params.width + col;
     let idx1 = (base + half) * params.width + col;
 
-    // Read pair.
+    // Read pair from one column (`col`) at two rows.
     let a = data[idx0];
     let b = data[idx1];
 
@@ -113,7 +118,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let twiddle = twiddles[params.twiddle_base + offset];
     let t = mul_mod(b, twiddle);
 
-    // In-place radix-2 butterfly outputs.
+    // In-place radix-2 butterfly:
+    //   out0 = a + w*b
+    //   out1 = a - w*b
+    // where w is this stage/lane twiddle.
+    //
+    // This is a 2-point transform applied repeatedly across the column:
+    // [out0]   [1   w][a]
+    // [out1] = [1  -w][b]
     data[idx0] = add_mod(a, t);
     data[idx1] = sub_mod(a, t);
 }
