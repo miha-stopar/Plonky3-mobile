@@ -88,6 +88,13 @@ struct VulkanRuntime {
     timestamp_log_emitted: bool,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct TimestampQuerySample {
+    value: u64,
+    availability: u64,
+}
+
 thread_local! {
     static VULKAN_RUNTIME_CACHE: RefCell<Option<VulkanRuntime>> = const { RefCell::new(None) };
 }
@@ -1194,7 +1201,7 @@ pub fn setup_vulkan_pipeline_plan(
             // Avoid blocking here; some mobile drivers can stall with WAIT despite
             // fence completion. If results are not ready, we skip GPU timing for
             // this call and keep functional behavior unchanged.
-            let mut queries = [0u64; 6];
+            let mut queries = [TimestampQuerySample::default(); 3];
             unsafe {
                 let query_res = ctx.device.get_query_pool_results(
                     pool,
@@ -1208,12 +1215,12 @@ pub fn setup_vulkan_pipeline_plan(
                     }
                 }
             }
-            let all_ready = queries[1] != 0 && queries[3] != 0 && queries[5] != 0;
+            let all_ready = queries.iter().all(|q| q.availability != 0);
             if all_ready {
                 let period_ns = ctx.timestamp_period_ns as f64;
-                let q0 = queries[0] as f64;
-                let q1 = queries[2] as f64;
-                let q2 = queries[4] as f64;
+                let q0 = queries[0].value as f64;
+                let q1 = queries[1].value as f64;
+                let q2 = queries[2].value as f64;
                 gpu_timing_ms = Some((
                     ((q1 - q0) * period_ns) / 1_000_000.0,
                     ((q2 - q1) * period_ns) / 1_000_000.0,
@@ -1284,7 +1291,8 @@ pub fn dft_batch<F: TwoAdicField>(
         bb_slice.iter().map(|v| v.to_unique_u32()).collect::<Vec<u32>>()
     };
 
-    // Preserve original input in BabyBear form for CPU/GPU comparison.
+    #[cfg(debug_assertions)]
+    // Preserve original input in BabyBear form only for debug CPU/GPU comparison.
     let original_bb_mat = RowMajorMatrix::new(
         input
             .iter()
@@ -1296,11 +1304,6 @@ pub fn dft_batch<F: TwoAdicField>(
 
     let gpu_out = setup_vulkan_pipeline_plan(&plan, &input)?;
 
-    // For now, only support BabyBear in the Vulkan path.
-    if core::any::TypeId::of::<F>() != core::any::TypeId::of::<BabyBear>() {
-        return Err("vulkan backend currently only supports BabyBear".to_string());
-    }
-
     let out_vals: Vec<BabyBear> = gpu_out
         .into_iter()
         .map(|v| BabyBear::new(monty_to_canonical(v)))
@@ -1308,7 +1311,8 @@ pub fn dft_batch<F: TwoAdicField>(
     let mut mat = RowMajorMatrix::new(out_vals, plan.params.width as usize);
 
     // Compare against CPU reference in debug builds only.
-    if cfg!(debug_assertions) && core::any::TypeId::of::<F>() == core::any::TypeId::of::<BabyBear>() {
+    #[cfg(debug_assertions)]
+    {
         let cpu_bb = Radix2DitParallel::<BabyBear>::default();
         let cpu_out = cpu_bb.dft_batch(original_bb_mat).to_row_major_matrix();
         let gpu_vals = &mat.values;
