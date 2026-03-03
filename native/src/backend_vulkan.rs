@@ -59,9 +59,9 @@ struct VulkanPipelineState {
 
 struct VulkanIoState {
     descriptor_pool: vk::DescriptorPool,
-    descriptor_set: vk::DescriptorSet,
-    data_buffer: vk::Buffer,
-    data_memory: vk::DeviceMemory,
+    descriptor_sets: [vk::DescriptorSet; 2],
+    data_buffers: [vk::Buffer; 2],
+    data_memories: [vk::DeviceMemory; 2],
     data_capacity: usize,
     staging_upload_buffer: vk::Buffer,
     staging_upload_memory: vk::DeviceMemory,
@@ -170,6 +170,11 @@ impl VulkanRuntime {
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::COMPUTE),
             vk::DescriptorSetLayoutBinding::default()
+                .binding(1)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+            vk::DescriptorSetLayoutBinding::default()
                 .binding(2)
                 .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                 .descriptor_count(1)
@@ -250,11 +255,15 @@ impl VulkanRuntime {
                 self.ctx.device.unmap_memory(io.staging_upload_memory);
                 self.ctx.device.unmap_memory(io.staging_readback_memory);
                 self.ctx.device.unmap_memory(io.twiddle_memory);
-                self.ctx.device.free_memory(io.data_memory, None);
+                for memory in io.data_memories {
+                    self.ctx.device.free_memory(memory, None);
+                }
                 self.ctx.device.free_memory(io.staging_upload_memory, None);
                 self.ctx.device.free_memory(io.staging_readback_memory, None);
                 self.ctx.device.free_memory(io.twiddle_memory, None);
-                self.ctx.device.destroy_buffer(io.data_buffer, None);
+                for buffer in io.data_buffers {
+                    self.ctx.device.destroy_buffer(buffer, None);
+                }
                 self.ctx
                     .device
                     .destroy_buffer(io.staging_upload_buffer, None);
@@ -286,35 +295,30 @@ impl VulkanRuntime {
             .as_ref()
             .ok_or_else(|| "pipeline must be initialized before IO".to_string())?;
 
-        let descriptor_pool_sizes = [
-            vk::DescriptorPoolSize {
-                ty: vk::DescriptorType::STORAGE_BUFFER,
-                descriptor_count: 1,
-            },
-            vk::DescriptorPoolSize {
-                ty: vk::DescriptorType::STORAGE_BUFFER,
-                descriptor_count: 1,
-            },
-        ];
+        let descriptor_pool_sizes = [vk::DescriptorPoolSize {
+            ty: vk::DescriptorType::STORAGE_BUFFER,
+            descriptor_count: 6,
+        }];
         let descriptor_pool_info = vk::DescriptorPoolCreateInfo::default()
             .pool_sizes(&descriptor_pool_sizes)
-            .max_sets(1);
+            .max_sets(2);
         let descriptor_pool = unsafe {
             self.ctx
                 .device
                 .create_descriptor_pool(&descriptor_pool_info, None)
                 .map_err(|e| format!("vk create descriptor pool: {e}"))?
         };
+        let set_layouts = [pipeline.descriptor_set_layout, pipeline.descriptor_set_layout];
         let set_alloc_info = vk::DescriptorSetAllocateInfo::default()
             .descriptor_pool(descriptor_pool)
-            .set_layouts(core::slice::from_ref(&pipeline.descriptor_set_layout));
-        let descriptor_set = unsafe {
+            .set_layouts(&set_layouts);
+        let descriptor_sets = unsafe {
             self.ctx
                 .device
                 .allocate_descriptor_sets(&set_alloc_info)
                 .map_err(|e| format!("vk allocate descriptor set: {e}"))?
-                .remove(0)
         };
+        let descriptor_sets = [descriptor_sets[0], descriptor_sets[1]];
 
         let data_buffer_info = vk::BufferCreateInfo::default()
             .size(data_size as u64)
@@ -337,7 +341,13 @@ impl VulkanRuntime {
             .usage(vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST)
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
 
-        let data_buffer = unsafe {
+        let data_buffer_a = unsafe {
+            self.ctx
+                .device
+                .create_buffer(&data_buffer_info, None)
+                .map_err(|e| format!("vk create data buffer: {e}"))?
+        };
+        let data_buffer_b = unsafe {
             self.ctx
                 .device
                 .create_buffer(&data_buffer_info, None)
@@ -362,7 +372,8 @@ impl VulkanRuntime {
                 .map_err(|e| format!("vk create twiddle buffer: {e}"))?
         };
 
-        let data_reqs = unsafe { self.ctx.device.get_buffer_memory_requirements(data_buffer) };
+        let data_reqs_a = unsafe { self.ctx.device.get_buffer_memory_requirements(data_buffer_a) };
+        let data_reqs_b = unsafe { self.ctx.device.get_buffer_memory_requirements(data_buffer_b) };
         let staging_upload_reqs =
             unsafe { self.ctx.device.get_buffer_memory_requirements(staging_upload_buffer) };
         let staging_readback_reqs =
@@ -387,7 +398,8 @@ impl VulkanRuntime {
                 })
                 .ok_or_else(|| format!("no suitable memory type for flags: {required:?}"))
         };
-        let find_type_prefer_device_local = |reqs: vk::MemoryRequirements| -> Result<u32, String> {
+        let find_type_prefer_device_local =
+            |reqs: vk::MemoryRequirements| -> Result<u32, String> {
             (0..mem_props.memory_type_count)
                 .find(|i| {
                     let suitable = (reqs.memory_type_bits & (1 << i)) != 0;
@@ -407,14 +419,18 @@ impl VulkanRuntime {
                 })
                 .ok_or_else(|| "no suitable memory type for data buffer".to_string())
         };
-        let data_mem_type = find_type_prefer_device_local(data_reqs)?;
+        let data_mem_type_a = find_type_prefer_device_local(data_reqs_a)?;
+        let data_mem_type_b = find_type_prefer_device_local(data_reqs_b)?;
         let staging_upload_mem_type = find_type(staging_upload_reqs, host_flags)?;
         let staging_readback_mem_type = find_type(staging_readback_reqs, host_flags)?;
         let twiddle_mem_type = find_type(twiddle_reqs, host_flags)?;
 
-        let data_alloc = vk::MemoryAllocateInfo::default()
-            .allocation_size(data_reqs.size)
-            .memory_type_index(data_mem_type);
+        let data_alloc_a = vk::MemoryAllocateInfo::default()
+            .allocation_size(data_reqs_a.size)
+            .memory_type_index(data_mem_type_a);
+        let data_alloc_b = vk::MemoryAllocateInfo::default()
+            .allocation_size(data_reqs_b.size)
+            .memory_type_index(data_mem_type_b);
         let staging_upload_alloc = vk::MemoryAllocateInfo::default()
             .allocation_size(staging_upload_reqs.size)
             .memory_type_index(staging_upload_mem_type);
@@ -424,10 +440,16 @@ impl VulkanRuntime {
         let twiddle_alloc = vk::MemoryAllocateInfo::default()
             .allocation_size(twiddle_reqs.size)
             .memory_type_index(twiddle_mem_type);
-        let data_memory = unsafe {
+        let data_memory_a = unsafe {
             self.ctx
                 .device
-                .allocate_memory(&data_alloc, None)
+                .allocate_memory(&data_alloc_a, None)
+                .map_err(|e| format!("vk alloc data memory: {e}"))?
+        };
+        let data_memory_b = unsafe {
+            self.ctx
+                .device
+                .allocate_memory(&data_alloc_b, None)
                 .map_err(|e| format!("vk alloc data memory: {e}"))?
         };
         let staging_upload_memory = unsafe {
@@ -451,7 +473,11 @@ impl VulkanRuntime {
         unsafe {
             self.ctx
                 .device
-                .bind_buffer_memory(data_buffer, data_memory, 0)
+                .bind_buffer_memory(data_buffer_a, data_memory_a, 0)
+                .map_err(|e| format!("vk bind data memory: {e}"))?;
+            self.ctx
+                .device
+                .bind_buffer_memory(data_buffer_b, data_memory_b, 0)
                 .map_err(|e| format!("vk bind data memory: {e}"))?;
             self.ctx
                 .device
@@ -498,8 +524,12 @@ impl VulkanRuntime {
                 as *mut u32
         };
 
-        let data_desc = vk::DescriptorBufferInfo::default()
-            .buffer(data_buffer)
+        let data_desc_a = vk::DescriptorBufferInfo::default()
+            .buffer(data_buffer_a)
+            .offset(0)
+            .range(data_size as u64);
+        let data_desc_b = vk::DescriptorBufferInfo::default()
+            .buffer(data_buffer_b)
             .offset(0)
             .range(data_size as u64);
         let twiddle_desc = vk::DescriptorBufferInfo::default()
@@ -507,26 +537,51 @@ impl VulkanRuntime {
             .offset(0)
             .range(twiddle_size as u64);
         let writes = [
+            // set0: dst=B, src=A, twiddles=T
             vk::WriteDescriptorSet::default()
-                .dst_set(descriptor_set)
+                .dst_set(descriptor_sets[0])
                 .dst_binding(0)
                 .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(core::slice::from_ref(&data_desc)),
+                .buffer_info(core::slice::from_ref(&data_desc_b)),
             vk::WriteDescriptorSet::default()
-                .dst_set(descriptor_set)
+                .dst_set(descriptor_sets[0])
+                .dst_binding(1)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(core::slice::from_ref(&data_desc_a)),
+            vk::WriteDescriptorSet::default()
+                .dst_set(descriptor_sets[0])
                 .dst_binding(2)
                 .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                 .buffer_info(core::slice::from_ref(&twiddle_desc)),
-        ];
-        unsafe {
-            self.ctx.device.update_descriptor_sets(&writes, &[]);
-        }
+            // set1: dst=A, src=B, twiddles=T
+            vk::WriteDescriptorSet::default()
+                .dst_set(descriptor_sets[1])
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(core::slice::from_ref(&data_desc_a)),
+            vk::WriteDescriptorSet::default()
+                .dst_set(descriptor_sets[1])
+                .dst_binding(1)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(core::slice::from_ref(&data_desc_b)),
+            vk::WriteDescriptorSet::default()
+                .dst_set(descriptor_sets[1])
+                .dst_binding(2)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(core::slice::from_ref(&twiddle_desc)),
+            ];
+            unsafe {
+                // Commit descriptor writes to the driver:
+                // set0[0]=B, set0[1]=A, set0[2]=T
+                // set1[0]=A, set1[1]=B, set1[2]=T
+                self.ctx.device.update_descriptor_sets(&writes, &[]);
+            }
 
         self.io = Some(VulkanIoState {
             descriptor_pool,
-            descriptor_set,
-            data_buffer,
-            data_memory,
+            descriptor_sets,
+            data_buffers: [data_buffer_a, data_buffer_b],
+            data_memories: [data_memory_a, data_memory_b],
             data_capacity: data_size,
             staging_upload_buffer,
             staging_upload_memory,
@@ -849,20 +904,12 @@ fn twiddles_for_stage(log_n: u32, stage: u32) -> Vec<u32> {
         .collect()
 }
 
-fn twiddle_table(log_n: u32) -> (Vec<u32>, Vec<u32>) {
+fn twiddle_table(log_n: u32) -> Vec<u32> {
     let mut all = Vec::new();
-    let mut stage_base = Vec::with_capacity(log_n as usize);
     for stage in 0..log_n {
-        stage_base.push(all.len() as u32);
         all.extend(twiddles_for_stage(log_n, stage));
     }
-    (all, stage_base)
-}
-
-fn twiddle_stage_base_table(log_n: u32) -> Vec<u32> {
-    // Stage s uses 2^s twiddles, so the packed base offset is:
-    // base[s] = sum_{k=0..s-1} 2^k = 2^s - 1.
-    (0..log_n).map(|s| (1u32 << s) - 1).collect()
+    all
 }
 
 fn reverse_bits_len_usize(mut x: usize, bits: usize) -> usize {
@@ -902,9 +949,10 @@ pub fn setup_vulkan_pipeline_plan(
     // Dataflow for one Vulkan DFT call:
     // 1) CPU `input` is a row-major flattened h x w matrix (h rows, w columns).
     // 2) We bit-reverse row indices for DIT, then write that into upload staging memory.
-    // 3) GPU copies upload staging -> `data_buffer` (main compute buffer).
-    // 4) For each FFT stage, one dispatch updates `data_buffer` in-place.
-    // 5) GPU copies `data_buffer` -> readback staging.
+    // 3) GPU copies upload staging -> ping buffer.
+    // 4) For each FFT stage, one dispatch reads src buffer and writes dst buffer.
+    //    Buffers alternate (ping-pong) between stages.
+    // 5) GPU copies final buffer -> readback staging.
     // 6) CPU reads readback staging into `gpu_out`.
     //
     // Terminology:
@@ -914,7 +962,7 @@ pub fn setup_vulkan_pipeline_plan(
     //
     // Memory roles:
     // - upload staging: CPU-write, GPU-read source for upload copy.
-    // - data_buffer: primary GPU compute buffer used by shader dispatches.
+    // - data_buffers[0/1]: ping-pong GPU compute buffers.
     // - readback staging: GPU-write destination for copy, then CPU-read.
     let total_start = Instant::now();
     with_vulkan_runtime(|runtime| {
@@ -936,7 +984,7 @@ pub fn setup_vulkan_pipeline_plan(
             .io
             .as_mut()
             .ok_or_else(|| "vulkan IO cache unexpectedly empty".to_string())?;
-        let descriptor_set = io_state.descriptor_set;
+        let mut current_buffer_idx = 0usize;
         let command_buffer = runtime
             .command_buffer
             .ok_or_else(|| "vulkan command buffer cache unexpectedly empty".to_string())?;
@@ -946,9 +994,6 @@ pub fn setup_vulkan_pipeline_plan(
 
         // Prepare input for DIT directly into upload staging (avoid temporary vec allocation).
         let mut params = plan.params;
-        // Stage base offsets are needed for every call; cheap to compute from log_n.
-        let twiddle_stage_base = twiddle_stage_base_table(params.log_n);
-
         let upload_start = Instant::now();
         let twiddles_updated = io_state.twiddle_uploaded_log_n != Some(params.log_n);
         let timestamp_pool = runtime.timestamp_query_pool;
@@ -958,7 +1003,7 @@ pub fn setup_vulkan_pipeline_plan(
 
             if twiddles_updated {
                 // Build+upload packed twiddles only when log_n changes.
-                let (twiddles_all, _) = twiddle_table(params.log_n);
+                let twiddles_all = twiddle_table(params.log_n);
                 let twiddle_slice =
                     core::slice::from_raw_parts_mut(io_state.twiddle_ptr, twiddle_total_count);
                 twiddle_slice[..twiddles_all.len()].copy_from_slice(&twiddles_all);
@@ -970,7 +1015,7 @@ pub fn setup_vulkan_pipeline_plan(
         }
         let upload_ms = upload_start.elapsed().as_millis();
 
-        // Run all FFT stages. `data_buffer` is updated in-place per stage.
+        // Run all FFT stages with ping-pong buffers.
         let stages_start = Instant::now();
         let begin_info = vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
@@ -1002,40 +1047,40 @@ pub fn setup_vulkan_pipeline_plan(
                 .buffer(io_state.staging_upload_buffer)
                 .offset(0)
                 .size(data_size as u64);
-            let mut host_barriers = Vec::with_capacity(2);
-            host_barriers.push(upload_host_barrier);
-            if twiddles_updated {
-                host_barriers.push(
-                    vk::BufferMemoryBarrier::default()
-                        .src_access_mask(vk::AccessFlags::HOST_WRITE)
-                        .dst_access_mask(vk::AccessFlags::SHADER_READ)
-                        .buffer(io_state.twiddle_buffer)
-                        .offset(0)
-                        .size(twiddle_size as u64),
-                );
-            }
+            let twiddle_host_barrier = vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::HOST_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                .buffer(io_state.twiddle_buffer)
+                .offset(0)
+                .size(twiddle_size as u64);
+            let host_barriers = [upload_host_barrier, twiddle_host_barrier];
+            let host_barriers_slice = if twiddles_updated {
+                &host_barriers[..]
+            } else {
+                &host_barriers[..1]
+            };
             ctx.device.cmd_pipeline_barrier(
                 command_buffer,
                 vk::PipelineStageFlags::HOST,
                 vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::COMPUTE_SHADER,
                 vk::DependencyFlags::empty(),
                 &[],
-                &host_barriers,
+                host_barriers_slice,
                 &[],
             );
-            // Step 3: copy CPU-uploaded input into main GPU compute buffer.
+            // Step 3: copy CPU-uploaded input into ping buffer.
             let upload_copy = vk::BufferCopy::default().size(data_size as u64);
             ctx.device.cmd_copy_buffer(
                 command_buffer,
                 io_state.staging_upload_buffer,
-                io_state.data_buffer,
+                io_state.data_buffers[current_buffer_idx],
                 core::slice::from_ref(&upload_copy),
             );
             // Step 4: make transfer writes visible to compute shader stages.
             let data_upload_barrier = vk::BufferMemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
                 .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
-                .buffer(io_state.data_buffer)
+                .buffer(io_state.data_buffers[current_buffer_idx])
                 .offset(0)
                 .size(data_size as u64);
             ctx.device.cmd_pipeline_barrier(
@@ -1047,17 +1092,9 @@ pub fn setup_vulkan_pipeline_plan(
                 core::slice::from_ref(&data_upload_barrier),
                 &[],
             );
-            // Step 5: bind compute pipeline + descriptor set (data buffer + twiddles).
+            // Step 5: bind compute pipeline.
             ctx.device
                 .cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::COMPUTE, pipeline);
-            ctx.device.cmd_bind_descriptor_sets(
-                command_buffer,
-                vk::PipelineBindPoint::COMPUTE,
-                pipeline_layout,
-                0,
-                core::slice::from_ref(&descriptor_set),
-                &[],
-            );
         }
 
         for stage in 0..params.log_n {
@@ -1071,7 +1108,7 @@ pub fn setup_vulkan_pipeline_plan(
             // each shader invocation handles one (col, j) pair.
             // col chooses which column, j chooses which butterfly lane in that stage.
             params.stage = stage;
-            params.twiddle_base = twiddle_stage_base[stage as usize];
+            params.twiddle_base = (1u32 << stage) - 1;
             // Packed values pushed to shader for this stage:
             // [width, height, stage, log_n, twiddle_base, pad, pad, pad]
             //
@@ -1095,6 +1132,18 @@ pub fn setup_vulkan_pipeline_plan(
                 )
             };
             unsafe {
+                // Choose the descriptor mapping for this stage:
+                // current=0 -> src=A,dst=B
+                // current=1 -> src=B,dst=A
+                let stage_set = io_state.descriptor_sets[current_buffer_idx];
+                ctx.device.cmd_bind_descriptor_sets(
+                    command_buffer,
+                    vk::PipelineBindPoint::COMPUTE,
+                    pipeline_layout,
+                    0,
+                    core::slice::from_ref(&stage_set),
+                    &[],
+                );
                 // Update shader-visible stage parameters for *this* dispatch only.
                 // Push constants are small command-stream values, not global constants.
                 // They are replaced each stage before cmd_dispatch.
@@ -1115,14 +1164,13 @@ pub fn setup_vulkan_pipeline_plan(
             }
 
             if stage + 1 < params.log_n {
-                // Step 6: stage-to-stage dependency within data_buffer.
-                // Next stage reads values produced by this stage.
+                // Step 6: stage-to-stage dependency on the stage output buffer.
                 let stage_barrier = vk::BufferMemoryBarrier::default()
                     .src_access_mask(vk::AccessFlags::SHADER_WRITE)
                     .dst_access_mask(
                         vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
                     )
-                    .buffer(io_state.data_buffer)
+                    .buffer(io_state.data_buffers[1 - current_buffer_idx])
                     .offset(0)
                     .size(data_size as u64);
                 unsafe {
@@ -1137,6 +1185,7 @@ pub fn setup_vulkan_pipeline_plan(
                     );
                 }
             }
+            current_buffer_idx = 1 - current_buffer_idx;
         }
         unsafe {
             if let Some(pool) = timestamp_pool {
@@ -1151,7 +1200,7 @@ pub fn setup_vulkan_pipeline_plan(
             let pre_copy_readback_barrier = vk::BufferMemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::SHADER_WRITE)
                 .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
-                .buffer(io_state.data_buffer)
+                .buffer(io_state.data_buffers[current_buffer_idx])
                 .offset(0)
                 .size(data_size as u64);
             ctx.device.cmd_pipeline_barrier(
@@ -1167,7 +1216,7 @@ pub fn setup_vulkan_pipeline_plan(
             let readback_copy = vk::BufferCopy::default().size(data_size as u64);
             ctx.device.cmd_copy_buffer(
                 command_buffer,
-                io_state.data_buffer,
+                io_state.data_buffers[current_buffer_idx],
                 io_state.staging_readback_buffer,
                 core::slice::from_ref(&readback_copy),
             );
@@ -1240,7 +1289,6 @@ pub fn setup_vulkan_pipeline_plan(
         }
         let readback_ms = readback_start.elapsed().as_millis();
 
-        let _ = descriptor_set;
         let total_ms = total_start.elapsed().as_millis();
         if let Some((gpu_stage_ms, gpu_readback_ms, gpu_total_ms)) = gpu_timing_ms {
             log_vulkan_timing(&format!(

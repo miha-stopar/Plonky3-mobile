@@ -7,7 +7,7 @@ use p3_challenger::{HashChallenger, SerializingChallenger32};
 use p3_commit::ExtensionMmcs;
 use crate::gpu_dft::{BackendKind, GpuDft};
 use p3_field::extension::BinomialExtensionField;
-use p3_field::{PrimeCharacteristicRing, PrimeField64};
+use p3_field::{PrimeCharacteristicRing, PrimeField32, PrimeField64};
 use p3_fri::{HidingFriPcs, create_test_fri_params};
 use p3_keccak::{Keccak256Hash, KeccakF};
 use p3_matrix::Matrix;
@@ -117,10 +117,13 @@ pub fn run_dft_benchmark() -> Result<String, String> {
 
     for &(height, width) in &cases {
         let input = benchmark_input(height, width);
+        let vk_plan =
+            crate::backend_vulkan::prepare_compute_plan(width, height, 0, height.trailing_zeros());
+        let vk_input_u32: Vec<u32> = input.values.iter().map(|v| v.to_unique_u32()).collect();
         let _ = crate::gpu_dft::take_last_vulkan_error();
         for _ in 0..warmup {
             let _ = cpu.dft_batch(input.clone());
-            let _ = vulkan.dft_batch(input.clone());
+            let _ = crate::backend_vulkan::setup_vulkan_pipeline_plan(&vk_plan, &vk_input_u32)?;
         }
 
         let mut cpu_samples_ms = Vec::with_capacity(repeats);
@@ -135,10 +138,13 @@ pub fn run_dft_benchmark() -> Result<String, String> {
         let cpu_p95_ms = percentile_ms(cpu_samples_ms, 0.95);
 
         let mut vk_samples_ms = Vec::with_capacity(repeats);
-        let mut vk_out = None;
+        let mut vk_out_u32 = None;
         for _ in 0..repeats {
             let start = Instant::now();
-            vk_out = Some(vulkan.dft_batch(input.clone()));
+            vk_out_u32 = Some(crate::backend_vulkan::setup_vulkan_pipeline_plan(
+                &vk_plan,
+                &vk_input_u32,
+            )?);
             vk_samples_ms.push(start.elapsed().as_secs_f64() * 1000.0);
         }
         let vk_avg_ms = vk_samples_ms.iter().copied().sum::<f64>() / repeats as f64;
@@ -152,7 +158,10 @@ pub fn run_dft_benchmark() -> Result<String, String> {
         }
 
         let cpu_out = cpu_out.ok_or_else(|| "cpu benchmark output missing".to_string())?;
-        let vk_out = vk_out.ok_or_else(|| "vulkan benchmark output missing".to_string())?;
+        let _vk_out_u32 =
+            vk_out_u32.ok_or_else(|| "vulkan benchmark output missing".to_string())?;
+        // Run one API-path Vulkan DFT for correctness/fallback checks.
+        let vk_out = vulkan.dft_batch(input.clone());
         if cpu_out.values != vk_out.values {
             return Err(format!("dft benchmark mismatch at h={height}, w={width}"));
         }

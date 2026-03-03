@@ -16,9 +16,14 @@ struct Params {
 };
 
 @group(0) @binding(0)
-// In-place FFT data buffer.
+// Stage output buffer.
 // Layout is row-major matrix: index = row * width + col.
-var<storage, read_write> data: array<u32>;
+var<storage, read_write> dst_data: array<u32>;
+
+@group(0) @binding(1)
+// Stage input buffer.
+// Layout is row-major matrix: index = row * width + col.
+var<storage, read> src_data: array<u32>;
 
 // Stage parameters are passed via Vulkan push constants.
 var<push_constant> params: Params;
@@ -111,8 +116,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx1 = (base + half) * params.width + col;
 
     // Read pair from one column (`col`) at two rows.
-    let a = data[idx0];
-    let b = data[idx1];
+    let a = src_data[idx0];
+    let b = src_data[idx1];
 
     // Stage-specific twiddle selection.
     let twiddle = twiddles[params.twiddle_base + offset];
@@ -126,6 +131,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // This is a 2-point transform applied repeatedly across the column:
     // [out0]   [1   w][a]
     // [out1] = [1  -w][b]
-    data[idx0] = add_mod(a, t);
-    data[idx1] = sub_mod(a, t);
+    dst_data[idx0] = add_mod(a, t);
+    dst_data[idx1] = sub_mod(a, t);
 }
