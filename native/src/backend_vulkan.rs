@@ -1564,6 +1564,279 @@ pub fn benchmark_vulkan_kernel_only_plan(
         Ok(samples_ms)
     })
 }
+
+pub fn benchmark_vulkan_e2e_batched_plan(
+    plan: &VulkanComputePlan,
+    input: &[u32],
+    warmup: usize,
+    repeats: usize,
+    batch_size: usize,
+) -> Result<Vec<f64>, String> {
+    if repeats == 0 {
+        return Ok(Vec::new());
+    }
+    if batch_size == 0 {
+        return Err("batch_size must be > 0".to_string());
+    }
+
+    with_vulkan_runtime(|runtime| {
+        runtime.ensure_pipeline()?;
+        runtime.ensure_exec_state()?;
+        runtime.ensure_timestamps()?;
+
+        let data_size = 4usize * input.len();
+        let twiddle_total_count = ((plan.params.height as usize).saturating_sub(1)).max(1);
+        let twiddle_size = 4usize * twiddle_total_count;
+        runtime.ensure_io(data_size, twiddle_size)?;
+
+        let ctx = &runtime.ctx;
+        let pipeline_state = runtime
+            .pipeline
+            .as_ref()
+            .ok_or_else(|| "vulkan pipeline cache unexpectedly empty".to_string())?;
+        let pipeline_layout = pipeline_state.pipeline_layout;
+        let pipeline = pipeline_state.pipeline;
+        let io_state = runtime
+            .io
+            .as_mut()
+            .ok_or_else(|| "vulkan IO cache unexpectedly empty".to_string())?;
+        let command_buffer = runtime
+            .command_buffer
+            .ok_or_else(|| "vulkan command buffer cache unexpectedly empty".to_string())?;
+        let submit_fence = runtime
+            .submit_fence
+            .ok_or_else(|| "vulkan submit fence cache unexpectedly empty".to_string())?;
+
+        let mut params = plan.params;
+        let twiddles_updated = io_state.twiddle_uploaded_log_n != Some(params.log_n);
+        if twiddles_updated {
+            unsafe {
+                let twiddles_all = twiddle_table(params.log_n);
+                let twiddle_slice =
+                    core::slice::from_raw_parts_mut(io_state.twiddle_ptr, twiddle_total_count);
+                twiddle_slice[..twiddles_all.len()].copy_from_slice(&twiddles_all);
+                if twiddles_all.len() < twiddle_total_count {
+                    twiddle_slice[twiddles_all.len()..].fill(0);
+                }
+                io_state.twiddle_uploaded_log_n = Some(params.log_n);
+            }
+        }
+
+        let begin_info = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        let submit_info =
+            vk::SubmitInfo::default().command_buffers(core::slice::from_ref(&command_buffer));
+
+        let total_iters = warmup + repeats;
+        let mut iter = 0usize;
+        let mut samples_ms = Vec::with_capacity(repeats);
+        while iter < total_iters {
+            let batch_len = core::cmp::min(batch_size, total_iters - iter);
+            let batch_start = Instant::now();
+
+            // Keep upload work in this timing path to preserve e2e characteristics,
+            // but amortize submit/fence by executing a batch in one command buffer.
+            unsafe {
+                for _ in 0..batch_len {
+                    let upload_slice =
+                        core::slice::from_raw_parts_mut(io_state.staging_upload_ptr, data_size / 4);
+                    write_bit_reversed_rows_u32(upload_slice, input, plan.params.width as usize);
+                }
+            }
+
+            unsafe {
+                ctx.device
+                    .reset_fences(&[submit_fence])
+                    .map_err(|e| format!("vk reset fence: {e}"))?;
+                ctx.device
+                    .reset_command_buffer(command_buffer, vk::CommandBufferResetFlags::empty())
+                    .map_err(|e| format!("vk reset command buffer: {e}"))?;
+                ctx.device
+                    .begin_command_buffer(command_buffer, &begin_info)
+                    .map_err(|e| format!("vk begin command buffer: {e}"))?;
+                ctx.device
+                    .cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::COMPUTE, pipeline);
+
+                let upload_host_barrier = vk::BufferMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::HOST_WRITE)
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                    .buffer(io_state.staging_upload_buffer)
+                    .offset(0)
+                    .size(data_size as u64);
+                let twiddle_host_barrier = vk::BufferMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::HOST_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                    .buffer(io_state.twiddle_buffer)
+                    .offset(0)
+                    .size(twiddle_size as u64);
+                let host_barriers = [upload_host_barrier, twiddle_host_barrier];
+                let host_barriers_slice = if twiddles_updated {
+                    &host_barriers[..]
+                } else {
+                    &host_barriers[..1]
+                };
+                ctx.device.cmd_pipeline_barrier(
+                    command_buffer,
+                    vk::PipelineStageFlags::HOST,
+                    vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    host_barriers_slice,
+                    &[],
+                );
+            }
+
+            for _ in 0..batch_len {
+                let mut current_buffer_idx = 0usize;
+                unsafe {
+                    let upload_copy = vk::BufferCopy::default().size(data_size as u64);
+                    ctx.device.cmd_copy_buffer(
+                        command_buffer,
+                        io_state.staging_upload_buffer,
+                        io_state.data_buffers[current_buffer_idx],
+                        core::slice::from_ref(&upload_copy),
+                    );
+                    let data_upload_barrier = vk::BufferMemoryBarrier::default()
+                        .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                        .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
+                        .buffer(io_state.data_buffers[current_buffer_idx])
+                        .offset(0)
+                        .size(data_size as u64);
+                    ctx.device.cmd_pipeline_barrier(
+                        command_buffer,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        vk::DependencyFlags::empty(),
+                        &[],
+                        core::slice::from_ref(&data_upload_barrier),
+                        &[],
+                    );
+                }
+
+                for stage in 0..params.log_n {
+                    params.stage = stage;
+                    params.twiddle_base = (1u32 << stage) - 1;
+                    let params_words = [
+                        params.width,
+                        params.height,
+                        params.stage,
+                        params.log_n,
+                        params.twiddle_base,
+                        params._pad0,
+                        params._pad1,
+                        params._pad2,
+                    ];
+                    let params_bytes = unsafe {
+                        core::slice::from_raw_parts(
+                            params_words.as_ptr() as *const u8,
+                            core::mem::size_of_val(&params_words),
+                        )
+                    };
+                    unsafe {
+                        let stage_set = io_state.descriptor_sets[current_buffer_idx];
+                        ctx.device.cmd_bind_descriptor_sets(
+                            command_buffer,
+                            vk::PipelineBindPoint::COMPUTE,
+                            pipeline_layout,
+                            0,
+                            core::slice::from_ref(&stage_set),
+                            &[],
+                        );
+                        ctx.device.cmd_push_constants(
+                            command_buffer,
+                            pipeline_layout,
+                            vk::ShaderStageFlags::COMPUTE,
+                            0,
+                            params_bytes,
+                        );
+                        let dispatch = dispatch_dims(&params);
+                        ctx.device
+                            .cmd_dispatch(command_buffer, dispatch.0, dispatch.1, dispatch.2);
+                    }
+                    if stage + 1 < params.log_n {
+                        let stage_barrier = vk::BufferMemoryBarrier::default()
+                            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                            .dst_access_mask(
+                                vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+                            )
+                            .buffer(io_state.data_buffers[1 - current_buffer_idx])
+                            .offset(0)
+                            .size(data_size as u64);
+                        unsafe {
+                            ctx.device.cmd_pipeline_barrier(
+                                command_buffer,
+                                vk::PipelineStageFlags::COMPUTE_SHADER,
+                                vk::PipelineStageFlags::COMPUTE_SHADER,
+                                vk::DependencyFlags::empty(),
+                                &[],
+                                core::slice::from_ref(&stage_barrier),
+                                &[],
+                            );
+                        }
+                    }
+                    current_buffer_idx = 1 - current_buffer_idx;
+                }
+
+                unsafe {
+                    let pre_copy_readback_barrier = vk::BufferMemoryBarrier::default()
+                        .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                        .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                        .buffer(io_state.data_buffers[current_buffer_idx])
+                        .offset(0)
+                        .size(data_size as u64);
+                    ctx.device.cmd_pipeline_barrier(
+                        command_buffer,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::DependencyFlags::empty(),
+                        &[],
+                        core::slice::from_ref(&pre_copy_readback_barrier),
+                        &[],
+                    );
+                    let readback_copy = vk::BufferCopy::default().size(data_size as u64);
+                    ctx.device.cmd_copy_buffer(
+                        command_buffer,
+                        io_state.data_buffers[current_buffer_idx],
+                        io_state.staging_readback_buffer,
+                        core::slice::from_ref(&readback_copy),
+                    );
+                }
+            }
+
+            unsafe {
+                ctx.device
+                    .end_command_buffer(command_buffer)
+                    .map_err(|e| format!("vk end command buffer: {e}"))?;
+                ctx.device
+                    .queue_submit(ctx.queue, core::slice::from_ref(&submit_info), submit_fence)
+                    .map_err(|e| format!("vk queue submit: {e}"))?;
+                ctx.device
+                    .wait_for_fences(&[submit_fence], true, u64::MAX)
+                    .map_err(|e| format!("vk wait for fence: {e}"))?;
+            }
+
+            // Preserve CPU-side readback copy cost in the timed e2e batch.
+            let mut tmp = vec![0u32; data_size / 4];
+            unsafe {
+                let readback_slice =
+                    core::slice::from_raw_parts(io_state.staging_readback_ptr as *const u32, data_size / 4);
+                for _ in 0..batch_len {
+                    tmp.copy_from_slice(readback_slice);
+                }
+            }
+
+            let per_iter_ms = batch_start.elapsed().as_secs_f64() * 1000.0 / batch_len as f64;
+            for in_batch in 0..batch_len {
+                if iter + in_batch >= warmup {
+                    samples_ms.push(per_iter_ms);
+                }
+            }
+            iter += batch_len;
+        }
+
+        Ok(samples_ms)
+    })
+}
 pub fn dft_batch<F: TwoAdicField>(
     _cpu: &Radix2DitParallel<F>,
     mat: RowMajorMatrix<F>,

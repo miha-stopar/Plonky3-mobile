@@ -110,6 +110,7 @@ pub fn run_dft_benchmark() -> Result<String, String> {
     ];
     let warmup = 1usize;
     let repeats = 10usize;
+    let e2e_batch_size = 4usize;
 
     let mut lines = vec![format!(
         "dft benchmark (repeats={repeats}, warmup={warmup}, stats=avg/median/p95)"
@@ -151,6 +152,17 @@ pub fn run_dft_benchmark() -> Result<String, String> {
         let vk_med_ms = percentile_ms(vk_samples_ms.clone(), 0.50);
         let vk_p95_ms = percentile_ms(vk_samples_ms, 0.95);
 
+        let vk_batched_samples_ms = crate::backend_vulkan::benchmark_vulkan_e2e_batched_plan(
+            &vk_plan,
+            &vk_input_u32,
+            warmup,
+            repeats,
+            e2e_batch_size,
+        )?;
+        let vk_batched_avg_ms = vk_batched_samples_ms.iter().copied().sum::<f64>() / repeats as f64;
+        let vk_batched_med_ms = percentile_ms(vk_batched_samples_ms.clone(), 0.50);
+        let vk_batched_p95_ms = percentile_ms(vk_batched_samples_ms, 0.95);
+
         let vk_kernel_samples_ms = crate::backend_vulkan::benchmark_vulkan_kernel_only_plan(
             &vk_plan,
             &vk_input_u32,
@@ -181,6 +193,11 @@ pub fn run_dft_benchmark() -> Result<String, String> {
         } else {
             0.0
         };
+        let speedup_e2e_batched_avg = if vk_batched_avg_ms > 0.0 {
+            cpu_avg_ms / vk_batched_avg_ms
+        } else {
+            0.0
+        };
         let speedup_kernel_avg = if vk_kernel_avg_ms > 0.0 {
             cpu_avg_ms / vk_kernel_avg_ms
         } else {
@@ -189,6 +206,7 @@ pub fn run_dft_benchmark() -> Result<String, String> {
         lines.push(format!(
             "h={height}, w={width}: cpu(avg={cpu_avg_ms:.3} med={cpu_med_ms:.3} p95={cpu_p95_ms:.3})ms \
 vk_e2e(avg={vk_avg_ms:.3} med={vk_med_ms:.3} p95={vk_p95_ms:.3})ms speedup_e2e(avg)={speedup_e2e_avg:.2}x \
+vk_e2e_batched(avg={vk_batched_avg_ms:.3} med={vk_batched_med_ms:.3} p95={vk_batched_p95_ms:.3})ms speedup_e2e_batched(avg)={speedup_e2e_batched_avg:.2}x \
 vk_kernel(avg={vk_kernel_avg_ms:.3} med={vk_kernel_med_ms:.3} p95={vk_kernel_p95_ms:.3})ms speedup_kernel(avg)={speedup_kernel_avg:.2}x"
         ));
     }
