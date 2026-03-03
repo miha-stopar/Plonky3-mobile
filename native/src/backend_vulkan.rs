@@ -1319,6 +1319,251 @@ pub fn setup_vulkan_pipeline_plan(
         Ok(gpu_out)
     })
 }
+
+pub fn benchmark_vulkan_kernel_only_plan(
+    plan: &VulkanComputePlan,
+    input: &[u32],
+    warmup: usize,
+    repeats: usize,
+) -> Result<Vec<f64>, String> {
+    if repeats == 0 {
+        return Ok(Vec::new());
+    }
+
+    with_vulkan_runtime(|runtime| {
+        runtime.ensure_pipeline()?;
+        runtime.ensure_exec_state()?;
+        runtime.ensure_timestamps()?;
+
+        let data_size = 4usize * input.len();
+        let twiddle_total_count = ((plan.params.height as usize).saturating_sub(1)).max(1);
+        let twiddle_size = 4usize * twiddle_total_count;
+        runtime.ensure_io(data_size, twiddle_size)?;
+
+        let ctx = &runtime.ctx;
+        let pipeline_state = runtime
+            .pipeline
+            .as_ref()
+            .ok_or_else(|| "vulkan pipeline cache unexpectedly empty".to_string())?;
+        let pipeline_layout = pipeline_state.pipeline_layout;
+        let pipeline = pipeline_state.pipeline;
+        let io_state = runtime
+            .io
+            .as_mut()
+            .ok_or_else(|| "vulkan IO cache unexpectedly empty".to_string())?;
+        let command_buffer = runtime
+            .command_buffer
+            .ok_or_else(|| "vulkan command buffer cache unexpectedly empty".to_string())?;
+        let submit_fence = runtime
+            .submit_fence
+            .ok_or_else(|| "vulkan submit fence cache unexpectedly empty".to_string())?;
+
+        let mut params = plan.params;
+        let twiddles_updated = io_state.twiddle_uploaded_log_n != Some(params.log_n);
+        unsafe {
+            let upload_slice =
+                core::slice::from_raw_parts_mut(io_state.staging_upload_ptr, data_size / 4);
+            write_bit_reversed_rows_u32(upload_slice, input, plan.params.width as usize);
+
+            if twiddles_updated {
+                let twiddles_all = twiddle_table(params.log_n);
+                let twiddle_slice =
+                    core::slice::from_raw_parts_mut(io_state.twiddle_ptr, twiddle_total_count);
+                twiddle_slice[..twiddles_all.len()].copy_from_slice(&twiddles_all);
+                if twiddles_all.len() < twiddle_total_count {
+                    twiddle_slice[twiddles_all.len()..].fill(0);
+                }
+                io_state.twiddle_uploaded_log_n = Some(params.log_n);
+            }
+        }
+
+        let begin_info = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        let submit_info =
+            vk::SubmitInfo::default().command_buffers(core::slice::from_ref(&command_buffer));
+
+        // Initialize GPU resident input once (host upload -> data buffer A).
+        unsafe {
+            ctx.device
+                .reset_fences(&[submit_fence])
+                .map_err(|e| format!("vk reset fence: {e}"))?;
+            ctx.device
+                .reset_command_buffer(command_buffer, vk::CommandBufferResetFlags::empty())
+                .map_err(|e| format!("vk reset command buffer: {e}"))?;
+            ctx.device
+                .begin_command_buffer(command_buffer, &begin_info)
+                .map_err(|e| format!("vk begin command buffer: {e}"))?;
+
+            let upload_host_barrier = vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::HOST_WRITE)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                .buffer(io_state.staging_upload_buffer)
+                .offset(0)
+                .size(data_size as u64);
+            let twiddle_host_barrier = vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::HOST_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                .buffer(io_state.twiddle_buffer)
+                .offset(0)
+                .size(twiddle_size as u64);
+            let host_barriers = [upload_host_barrier, twiddle_host_barrier];
+            let host_barriers_slice = if twiddles_updated {
+                &host_barriers[..]
+            } else {
+                &host_barriers[..1]
+            };
+            ctx.device.cmd_pipeline_barrier(
+                command_buffer,
+                vk::PipelineStageFlags::HOST,
+                vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                host_barriers_slice,
+                &[],
+            );
+
+            let upload_copy = vk::BufferCopy::default().size(data_size as u64);
+            ctx.device.cmd_copy_buffer(
+                command_buffer,
+                io_state.staging_upload_buffer,
+                io_state.data_buffers[0],
+                core::slice::from_ref(&upload_copy),
+            );
+            let data_upload_barrier = vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
+                .buffer(io_state.data_buffers[0])
+                .offset(0)
+                .size(data_size as u64);
+            ctx.device.cmd_pipeline_barrier(
+                command_buffer,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                core::slice::from_ref(&data_upload_barrier),
+                &[],
+            );
+
+            ctx.device
+                .end_command_buffer(command_buffer)
+                .map_err(|e| format!("vk end command buffer: {e}"))?;
+            ctx.device
+                .queue_submit(ctx.queue, core::slice::from_ref(&submit_info), submit_fence)
+                .map_err(|e| format!("vk queue submit: {e}"))?;
+            ctx.device
+                .wait_for_fences(&[submit_fence], true, u64::MAX)
+                .map_err(|e| format!("vk wait for fence: {e}"))?;
+        }
+
+        let mut samples_ms = Vec::with_capacity(repeats);
+        let mut current_input_buffer_idx = 0usize;
+        for iter in 0..(warmup + repeats) {
+            let start = Instant::now();
+            let mut current_buffer_idx = current_input_buffer_idx;
+
+            unsafe {
+                ctx.device
+                    .reset_fences(&[submit_fence])
+                    .map_err(|e| format!("vk reset fence: {e}"))?;
+                ctx.device
+                    .reset_command_buffer(command_buffer, vk::CommandBufferResetFlags::empty())
+                    .map_err(|e| format!("vk reset command buffer: {e}"))?;
+                ctx.device
+                    .begin_command_buffer(command_buffer, &begin_info)
+                    .map_err(|e| format!("vk begin command buffer: {e}"))?;
+                ctx.device
+                    .cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::COMPUTE, pipeline);
+            }
+
+            for stage in 0..params.log_n {
+                params.stage = stage;
+                params.twiddle_base = (1u32 << stage) - 1;
+                let params_words = [
+                    params.width,
+                    params.height,
+                    params.stage,
+                    params.log_n,
+                    params.twiddle_base,
+                    params._pad0,
+                    params._pad1,
+                    params._pad2,
+                ];
+                let params_bytes = unsafe {
+                    core::slice::from_raw_parts(
+                        params_words.as_ptr() as *const u8,
+                        core::mem::size_of_val(&params_words),
+                    )
+                };
+
+                unsafe {
+                    let stage_set = io_state.descriptor_sets[current_buffer_idx];
+                    ctx.device.cmd_bind_descriptor_sets(
+                        command_buffer,
+                        vk::PipelineBindPoint::COMPUTE,
+                        pipeline_layout,
+                        0,
+                        core::slice::from_ref(&stage_set),
+                        &[],
+                    );
+                    ctx.device.cmd_push_constants(
+                        command_buffer,
+                        pipeline_layout,
+                        vk::ShaderStageFlags::COMPUTE,
+                        0,
+                        params_bytes,
+                    );
+                    let dispatch = dispatch_dims(&params);
+                    ctx.device
+                        .cmd_dispatch(command_buffer, dispatch.0, dispatch.1, dispatch.2);
+                }
+
+                if stage + 1 < params.log_n {
+                    let stage_barrier = vk::BufferMemoryBarrier::default()
+                        .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                        .dst_access_mask(
+                            vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+                        )
+                        .buffer(io_state.data_buffers[1 - current_buffer_idx])
+                        .offset(0)
+                        .size(data_size as u64);
+                    unsafe {
+                        ctx.device.cmd_pipeline_barrier(
+                            command_buffer,
+                            vk::PipelineStageFlags::COMPUTE_SHADER,
+                            vk::PipelineStageFlags::COMPUTE_SHADER,
+                            vk::DependencyFlags::empty(),
+                            &[],
+                            core::slice::from_ref(&stage_barrier),
+                            &[],
+                        );
+                    }
+                }
+
+                current_buffer_idx = 1 - current_buffer_idx;
+            }
+
+            unsafe {
+                ctx.device
+                    .end_command_buffer(command_buffer)
+                    .map_err(|e| format!("vk end command buffer: {e}"))?;
+                ctx.device
+                    .queue_submit(ctx.queue, core::slice::from_ref(&submit_info), submit_fence)
+                    .map_err(|e| format!("vk queue submit: {e}"))?;
+                ctx.device
+                    .wait_for_fences(&[submit_fence], true, u64::MAX)
+                    .map_err(|e| format!("vk wait for fence: {e}"))?;
+            }
+
+            current_input_buffer_idx = current_buffer_idx;
+            if iter >= warmup {
+                samples_ms.push(start.elapsed().as_secs_f64() * 1000.0);
+            }
+        }
+
+        Ok(samples_ms)
+    })
+}
 pub fn dft_batch<F: TwoAdicField>(
     _cpu: &Radix2DitParallel<F>,
     mat: RowMajorMatrix<F>,
