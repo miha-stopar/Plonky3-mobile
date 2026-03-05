@@ -52,9 +52,11 @@ struct VulkanContext {
 
 struct VulkanPipelineState {
     shader_module: vk::ShaderModule,
+    fused_shader_module: vk::ShaderModule,
     descriptor_set_layout: vk::DescriptorSetLayout,
     pipeline_layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
+    fused_pipeline: vk::Pipeline,
 }
 
 struct VulkanIoState {
@@ -163,6 +165,17 @@ impl VulkanRuntime {
                 .create_shader_module(&shader_info, None)
                 .map_err(|e| format!("vk create shader module: {e}"))?
         };
+        let fused_spv = fft_stage_fused_spv();
+        let fused_words = unsafe {
+            core::slice::from_raw_parts(fused_spv.as_ptr() as *const u32, fused_spv.len() / 4)
+        };
+        let fused_shader_info = vk::ShaderModuleCreateInfo::default().code(fused_words);
+        let fused_shader_module = unsafe {
+            self.ctx
+                .device
+                .create_shader_module(&fused_shader_info, None)
+                .map_err(|e| format!("vk create fused shader module: {e}"))?
+        };
         let bindings = [
             vk::DescriptorSetLayoutBinding::default()
                 .binding(0)
@@ -215,11 +228,31 @@ impl VulkanRuntime {
                 .map_err(|(_, e)| format!("vk create compute pipeline: {e}"))?
                 .remove(0)
         };
+        let fused_stage_info = vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::COMPUTE)
+            .module(fused_shader_module)
+            .name(entry_name);
+        let fused_pipeline_info = vk::ComputePipelineCreateInfo::default()
+            .stage(fused_stage_info)
+            .layout(pipeline_layout);
+        let fused_pipeline = unsafe {
+            self.ctx
+                .device
+                .create_compute_pipelines(
+                    vk::PipelineCache::null(),
+                    core::slice::from_ref(&fused_pipeline_info),
+                    None,
+                )
+                .map_err(|(_, e)| format!("vk create fused compute pipeline: {e}"))?
+                .remove(0)
+        };
         self.pipeline = Some(VulkanPipelineState {
             shader_module,
+            fused_shader_module,
             descriptor_set_layout,
             pipeline_layout,
             pipeline,
+            fused_pipeline,
         });
         Ok(())
     }
@@ -722,11 +755,17 @@ impl Drop for VulkanRuntime {
                 self.ctx.device.destroy_pipeline(pipeline.pipeline, None);
                 self.ctx
                     .device
+                    .destroy_pipeline(pipeline.fused_pipeline, None);
+                self.ctx
+                    .device
                     .destroy_pipeline_layout(pipeline.pipeline_layout, None);
                 self.ctx
                     .device
                     .destroy_descriptor_set_layout(pipeline.descriptor_set_layout, None);
                 self.ctx.device.destroy_shader_module(pipeline.shader_module, None);
+                self.ctx
+                    .device
+                    .destroy_shader_module(pipeline.fused_shader_module, None);
             }
         }
     }
@@ -772,6 +811,10 @@ pub fn fft_stage_spv() -> &'static [u8] {
     include_bytes!(concat!(env!("OUT_DIR"), "/fft_stage.spv"))
 }
 
+pub fn fft_stage_fused_spv() -> &'static [u8] {
+    include_bytes!(concat!(env!("OUT_DIR"), "/fft_stage_fused.spv"))
+}
+
 pub fn dispatch_dims(params: &FftStageParams) -> (u32, u32, u32) {
     // Dispatch geometry for shader main(gid):
     // - gid.x maps to `col` (batched FFT column index)
@@ -793,6 +836,20 @@ pub fn dispatch_dims(params: &FftStageParams) -> (u32, u32, u32) {
     let x = width.div_ceil(workgroup_x);
     let y = j_count.max(1).div_ceil(workgroup_y);
     (x, y, 1)
+}
+
+pub fn can_use_fused_stage(params: &FftStageParams, stage: u32) -> bool {
+    let _ = (params, stage);
+    false
+}
+
+pub fn dispatch_dims_fused(params: &FftStageParams, stage: u32) -> (u32, u32, u32) {
+    let width = params.width.max(1);
+    let workgroup_x = 8u32;
+    let tile_size = 1u32 << (stage + 2);
+    let blocks = (params.height / tile_size).max(1);
+    let x = width.div_ceil(workgroup_x);
+    (x, blocks, 1)
 }
 
 pub fn cpu_stage_u32_in_place(data: &mut [u32], params: FftStageParams, twiddles: &[u32]) {
@@ -980,6 +1037,7 @@ pub fn setup_vulkan_pipeline_plan(
             .ok_or_else(|| "vulkan pipeline cache unexpectedly empty".to_string())?;
         let pipeline_layout = pipeline_state.pipeline_layout;
         let pipeline = pipeline_state.pipeline;
+        let fused_pipeline = pipeline_state.fused_pipeline;
         let io_state = runtime
             .io
             .as_mut()
@@ -1092,12 +1150,12 @@ pub fn setup_vulkan_pipeline_plan(
                 core::slice::from_ref(&data_upload_barrier),
                 &[],
             );
-            // Step 5: bind compute pipeline.
-            ctx.device
-                .cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::COMPUTE, pipeline);
+            // Step 5: compute pipelines are bound per-dispatch inside the stage loop.
         }
 
-        for stage in 0..params.log_n {
+        let mut stage = 0u32;
+        let mut last_bound_pipeline: Option<vk::Pipeline> = None;
+        while stage < params.log_n {
             // Stage context (DIT radix-2 on each column independently):
             // - stage 0 uses pair distance 1 (size-2 butterflies)
             // - stage 1 uses pair distance 2 (size-4 butterflies)
@@ -1131,11 +1189,21 @@ pub fn setup_vulkan_pipeline_plan(
                     core::mem::size_of_val(&params_words),
                 )
             };
+            let use_fused = can_use_fused_stage(&params, stage);
             unsafe {
+                let bound_pipeline = if use_fused { fused_pipeline } else { pipeline };
                 // Choose the descriptor mapping for this stage:
                 // current=0 -> src=A,dst=B
                 // current=1 -> src=B,dst=A
                 let stage_set = io_state.descriptor_sets[current_buffer_idx];
+                if last_bound_pipeline != Some(bound_pipeline) {
+                    ctx.device.cmd_bind_pipeline(
+                        command_buffer,
+                        vk::PipelineBindPoint::COMPUTE,
+                        bound_pipeline,
+                    );
+                    last_bound_pipeline = Some(bound_pipeline);
+                }
                 ctx.device.cmd_bind_descriptor_sets(
                     command_buffer,
                     vk::PipelineBindPoint::COMPUTE,
@@ -1154,7 +1222,11 @@ pub fn setup_vulkan_pipeline_plan(
                     0,
                     params_bytes,
                 );
-                let dispatch = dispatch_dims(&params);
+                let dispatch = if use_fused {
+                    dispatch_dims_fused(&params, stage)
+                } else {
+                    dispatch_dims(&params)
+                };
                 // Launch grid:
                 // - X covers columns in groups of 8 threads  (workgroup_size x = 8)
                 // - Y covers butterfly lanes in groups of 8 (workgroup_size y = 8)
@@ -1163,7 +1235,12 @@ pub fn setup_vulkan_pipeline_plan(
                     .cmd_dispatch(command_buffer, dispatch.0, dispatch.1, dispatch.2);
             }
 
-            if stage + 1 < params.log_n {
+            let next_stage = if use_fused {
+                stage + 2
+            } else {
+                stage + 1
+            };
+            if next_stage < params.log_n {
                 // Step 6: stage-to-stage dependency on the stage output buffer.
                 let stage_barrier = vk::BufferMemoryBarrier::default()
                     .src_access_mask(vk::AccessFlags::SHADER_WRITE)
@@ -1182,10 +1259,11 @@ pub fn setup_vulkan_pipeline_plan(
                         &[],
                         core::slice::from_ref(&stage_barrier),
                         &[],
-                    );
+                        );
                 }
             }
             current_buffer_idx = 1 - current_buffer_idx;
+            stage = next_stage;
         }
         unsafe {
             if let Some(pool) = timestamp_pool {
@@ -1347,6 +1425,7 @@ pub fn benchmark_vulkan_kernel_only_plan(
             .ok_or_else(|| "vulkan pipeline cache unexpectedly empty".to_string())?;
         let pipeline_layout = pipeline_state.pipeline_layout;
         let pipeline = pipeline_state.pipeline;
+        let fused_pipeline = pipeline_state.fused_pipeline;
         let io_state = runtime
             .io
             .as_mut()
@@ -1472,11 +1551,11 @@ pub fn benchmark_vulkan_kernel_only_plan(
                 ctx.device
                     .begin_command_buffer(command_buffer, &begin_info)
                     .map_err(|e| format!("vk begin command buffer: {e}"))?;
-                ctx.device
-                    .cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::COMPUTE, pipeline);
             }
 
-            for stage in 0..params.log_n {
+            let mut stage = 0u32;
+            let mut last_bound_pipeline: Option<vk::Pipeline> = None;
+            while stage < params.log_n {
                 params.stage = stage;
                 params.twiddle_base = (1u32 << stage) - 1;
                 let params_words = [
@@ -1496,7 +1575,17 @@ pub fn benchmark_vulkan_kernel_only_plan(
                     )
                 };
 
+                let use_fused = can_use_fused_stage(&params, stage);
                 unsafe {
+                    let bound_pipeline = if use_fused { fused_pipeline } else { pipeline };
+                    if last_bound_pipeline != Some(bound_pipeline) {
+                        ctx.device.cmd_bind_pipeline(
+                            command_buffer,
+                            vk::PipelineBindPoint::COMPUTE,
+                            bound_pipeline,
+                        );
+                        last_bound_pipeline = Some(bound_pipeline);
+                    }
                     let stage_set = io_state.descriptor_sets[current_buffer_idx];
                     ctx.device.cmd_bind_descriptor_sets(
                         command_buffer,
@@ -1513,12 +1602,21 @@ pub fn benchmark_vulkan_kernel_only_plan(
                         0,
                         params_bytes,
                     );
-                    let dispatch = dispatch_dims(&params);
+                    let dispatch = if use_fused {
+                        dispatch_dims_fused(&params, stage)
+                    } else {
+                        dispatch_dims(&params)
+                    };
                     ctx.device
                         .cmd_dispatch(command_buffer, dispatch.0, dispatch.1, dispatch.2);
                 }
 
-                if stage + 1 < params.log_n {
+                let next_stage = if use_fused {
+                    stage + 2
+                } else {
+                    stage + 1
+                };
+                if next_stage < params.log_n {
                     let stage_barrier = vk::BufferMemoryBarrier::default()
                         .src_access_mask(vk::AccessFlags::SHADER_WRITE)
                         .dst_access_mask(
@@ -1541,6 +1639,7 @@ pub fn benchmark_vulkan_kernel_only_plan(
                 }
 
                 current_buffer_idx = 1 - current_buffer_idx;
+                stage = next_stage;
             }
 
             unsafe {
@@ -1596,6 +1695,7 @@ pub fn benchmark_vulkan_e2e_batched_plan(
             .ok_or_else(|| "vulkan pipeline cache unexpectedly empty".to_string())?;
         let pipeline_layout = pipeline_state.pipeline_layout;
         let pipeline = pipeline_state.pipeline;
+        let fused_pipeline = pipeline_state.fused_pipeline;
         let io_state = runtime
             .io
             .as_mut()
@@ -1654,9 +1754,6 @@ pub fn benchmark_vulkan_e2e_batched_plan(
                 ctx.device
                     .begin_command_buffer(command_buffer, &begin_info)
                     .map_err(|e| format!("vk begin command buffer: {e}"))?;
-                ctx.device
-                    .cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::COMPUTE, pipeline);
-
                 let upload_host_barrier = vk::BufferMemoryBarrier::default()
                     .src_access_mask(vk::AccessFlags::HOST_WRITE)
                     .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
@@ -1713,7 +1810,9 @@ pub fn benchmark_vulkan_e2e_batched_plan(
                     );
                 }
 
-                for stage in 0..params.log_n {
+                let mut stage = 0u32;
+                let mut last_bound_pipeline: Option<vk::Pipeline> = None;
+                while stage < params.log_n {
                     params.stage = stage;
                     params.twiddle_base = (1u32 << stage) - 1;
                     let params_words = [
@@ -1732,7 +1831,17 @@ pub fn benchmark_vulkan_e2e_batched_plan(
                             core::mem::size_of_val(&params_words),
                         )
                     };
+                    let use_fused = can_use_fused_stage(&params, stage);
                     unsafe {
+                        let bound_pipeline = if use_fused { fused_pipeline } else { pipeline };
+                        if last_bound_pipeline != Some(bound_pipeline) {
+                            ctx.device.cmd_bind_pipeline(
+                                command_buffer,
+                                vk::PipelineBindPoint::COMPUTE,
+                                bound_pipeline,
+                            );
+                            last_bound_pipeline = Some(bound_pipeline);
+                        }
                         let stage_set = io_state.descriptor_sets[current_buffer_idx];
                         ctx.device.cmd_bind_descriptor_sets(
                             command_buffer,
@@ -1749,11 +1858,20 @@ pub fn benchmark_vulkan_e2e_batched_plan(
                             0,
                             params_bytes,
                         );
-                        let dispatch = dispatch_dims(&params);
+                        let dispatch = if use_fused {
+                            dispatch_dims_fused(&params, stage)
+                        } else {
+                            dispatch_dims(&params)
+                        };
                         ctx.device
                             .cmd_dispatch(command_buffer, dispatch.0, dispatch.1, dispatch.2);
                     }
-                    if stage + 1 < params.log_n {
+                    let next_stage = if use_fused {
+                        stage + 2
+                    } else {
+                        stage + 1
+                    };
+                    if next_stage < params.log_n {
                         let stage_barrier = vk::BufferMemoryBarrier::default()
                             .src_access_mask(vk::AccessFlags::SHADER_WRITE)
                             .dst_access_mask(
@@ -1775,6 +1893,7 @@ pub fn benchmark_vulkan_e2e_batched_plan(
                         }
                     }
                     current_buffer_idx = 1 - current_buffer_idx;
+                    stage = next_stage;
                 }
 
                 unsafe {

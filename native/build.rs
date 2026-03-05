@@ -32,4 +32,5 @@ fn compile_wgsl(shader_path: &str, spv_name: &str) {
 fn main() {
     compile_wgsl("shaders/add.wgsl", "add.spv");
     compile_wgsl("shaders/fft_stage.wgsl", "fft_stage.spv");
+    compile_wgsl("shaders/fft_stage_fused.wgsl", "fft_stage_fused.spv");
 }
