@@ -107,6 +107,13 @@ pub fn run_dft_benchmark() -> Result<String, String> {
         (16384, 8),
         (4096, 32),
         (16384, 32),
+        // Wider batches to test column-parallel behavior and fused-stage policy.
+        (4096, 64),
+        (4096, 128),
+        (16384, 64),
+        (16384, 128),
+        // Stress wide-column throughput while keeping total footprint manageable.
+        (256, 16000),
     ];
     let warmup = 1usize;
     let repeats = 10usize;

@@ -24,12 +24,13 @@ const PRIME: u32 = 0x78000001u;
 const MONTY_MU: u32 = 0x88000001u;
 const MONTY_MASK: u32 = 0xffffffffu;
 
-const WG_X: u32 = 8u;
-const WG_Y: u32 = 8u;
-const MAX_TILE: u32 = 32u;
+const WG_X: u32 = 4u;
+const WG_Y: u32 = 32u;
+const TILE_ROWS: u32 = 256u;
+const MAX_FUSED_STAGE: u32 = 7u; // stages with m <= TILE_ROWS
 
-// One column tile per local x lane; max tile is 32 rows.
-var<workgroup> shared_tile: array<u32, 256u>;
+// One row tile per local x lane (column in the workgroup's column block).
+var<workgroup> shared_tile: array<u32, 1024u>;
 
 fn add_mod(a: u32, b: u32) -> u32 {
     let sum = a + b;
@@ -63,7 +64,7 @@ fn mul_mod(a: u32, b: u32) -> u32 {
     return monty_reduce(prod);
 }
 
-@compute @workgroup_size(8, 8, 1)
+@compute @workgroup_size(4, 32, 1)
 fn main(
     @builtin(local_invocation_id) lid: vec3<u32>,
     @builtin(workgroup_id) wid: vec3<u32>,
@@ -72,72 +73,66 @@ fn main(
     if (col >= params.width) {
         return;
     }
-    // This shader fuses exactly two consecutive stages starting at `stage`.
-    if (params.stage + 1u >= params.log_n || params.stage > 3u) {
-        return;
-    }
-
-    let tile_size = 1u << (params.stage + 2u); // 4 * 2^stage
-    if (tile_size > MAX_TILE) {
+    // This shader fuses a stage window inside one TILE_ROWS chunk.
+    // Host only routes here when at least two stages can be fused.
+    if (params.stage >= params.log_n || params.stage > MAX_FUSED_STAGE) {
         return;
     }
 
     let block = wid.y;
-    let num_blocks = params.height / tile_size;
+    let num_blocks = (params.height + TILE_ROWS - 1u) / TILE_ROWS;
     if (block >= num_blocks) {
         return;
     }
 
-    let base_row = block * tile_size;
-    let tile_off = lid.x * MAX_TILE;
+    let base_row = block * TILE_ROWS;
+    let valid_rows = min(TILE_ROWS, params.height - base_row);
+    if (valid_rows < 2u) {
+        return;
+    }
+    let tile_off = lid.x * TILE_ROWS;
 
     // Load one column tile from global storage into workgroup memory.
-    for (var lane = lid.y; lane < tile_size; lane = lane + WG_Y) {
+    for (var lane = lid.y; lane < valid_rows; lane = lane + WG_Y) {
         let global_idx = (base_row + lane) * params.width + col;
         shared_tile[tile_off + lane] = src_data[global_idx];
     }
     workgroupBarrier();
 
-    // Stage s inside the tile.
-    let half0 = 1u << params.stage;
-    let m0 = half0 << 1u;
-    let j_count = tile_size >> 1u;
-    for (var j = lid.y; j < j_count; j = j + WG_Y) {
-        let block0 = j / half0;
-        let offset0 = j % half0;
-        let base0 = block0 * m0 + offset0;
-        let idx0 = tile_off + base0;
-        let idx1 = idx0 + half0;
-        let a = shared_tile[idx0];
-        let b = shared_tile[idx1];
-        let twiddle0 = twiddles[params.twiddle_base + offset0];
-        let t0 = mul_mod(b, twiddle0);
-        shared_tile[idx0] = add_mod(a, t0);
-        shared_tile[idx1] = sub_mod(a, t0);
+    var s = params.stage;
+    loop {
+        if (s >= params.log_n || s > MAX_FUSED_STAGE) {
+            break;
+        }
+        let half = 1u << s;
+        let m = half << 1u;
+        if (m > valid_rows) {
+            break;
+        }
+        let twiddle_base = (1u << s) - 1u;
+        let j_count = valid_rows >> 1u;
+        for (var j = lid.y; j < j_count; j = j + WG_Y) {
+            let block_s = j / half;
+            let offset = j % half;
+            let base = block_s * m + offset;
+            if (base + half >= valid_rows) {
+                continue;
+            }
+            let idx0 = tile_off + base;
+            let idx1 = idx0 + half;
+            let a = shared_tile[idx0];
+            let b = shared_tile[idx1];
+            let tw = twiddles[twiddle_base + offset];
+            let t = mul_mod(b, tw);
+            shared_tile[idx0] = add_mod(a, t);
+            shared_tile[idx1] = sub_mod(a, t);
+        }
+        workgroupBarrier();
+        s = s + 1u;
     }
-    workgroupBarrier();
-
-    // Stage s+1 inside the same tile (keeps intermediate in workgroup memory).
-    let half1 = half0 << 1u;
-    let m1 = half1 << 1u;
-    let twiddle_base1 = params.twiddle_base + half0;
-    for (var j = lid.y; j < j_count; j = j + WG_Y) {
-        let block1 = j / half1;
-        let offset1 = j % half1;
-        let base1 = block1 * m1 + offset1;
-        let idx0 = tile_off + base1;
-        let idx1 = idx0 + half1;
-        let a = shared_tile[idx0];
-        let b = shared_tile[idx1];
-        let twiddle1 = twiddles[twiddle_base1 + offset1];
-        let t1 = mul_mod(b, twiddle1);
-        shared_tile[idx0] = add_mod(a, t1);
-        shared_tile[idx1] = sub_mod(a, t1);
-    }
-    workgroupBarrier();
 
     // Store tile result once back to global storage.
-    for (var lane = lid.y; lane < tile_size; lane = lane + WG_Y) {
+    for (var lane = lid.y; lane < valid_rows; lane = lane + WG_Y) {
         let global_idx = (base_row + lane) * params.width + col;
         dst_data[global_idx] = shared_tile[tile_off + lane];
     }

@@ -839,15 +839,41 @@ pub fn dispatch_dims(params: &FftStageParams) -> (u32, u32, u32) {
 }
 
 pub fn can_use_fused_stage(params: &FftStageParams, stage: u32) -> bool {
-    let _ = (params, stage);
-    false
+    fused_stage_span(params, stage) > 1
+}
+
+pub fn fused_stage_span(params: &FftStageParams, stage: u32) -> u32 {
+    // Keep in sync with fft_stage_fused.wgsl constants.
+    const FUSED_TILE_ROWS: u32 = 256;
+    const FUSED_MAX_STAGE: u32 = 7;
+
+    if params.width < 64 || stage >= params.log_n || stage > FUSED_MAX_STAGE {
+        return 1;
+    }
+    let mut s = stage;
+    let mut span = 0u32;
+    while s < params.log_n && s <= FUSED_MAX_STAGE {
+        let m = 1u32 << (s + 1);
+        if m > FUSED_TILE_ROWS {
+            break;
+        }
+        span += 1;
+        s += 1;
+    }
+    // Only use fused path when it can do at least two stages.
+    if span >= 2 {
+        span
+    } else {
+        1
+    }
 }
 
 pub fn dispatch_dims_fused(params: &FftStageParams, stage: u32) -> (u32, u32, u32) {
+    let _ = stage;
     let width = params.width.max(1);
-    let workgroup_x = 8u32;
-    let tile_size = 1u32 << (stage + 2);
-    let blocks = (params.height / tile_size).max(1);
+    let workgroup_x = 4u32;
+    let tile_rows = 256u32;
+    let blocks = params.height.max(1).div_ceil(tile_rows);
     let x = width.div_ceil(workgroup_x);
     (x, blocks, 1)
 }
@@ -1235,8 +1261,9 @@ pub fn setup_vulkan_pipeline_plan(
                     .cmd_dispatch(command_buffer, dispatch.0, dispatch.1, dispatch.2);
             }
 
+            let fused_span = fused_stage_span(&params, stage);
             let next_stage = if use_fused {
-                stage + 2
+                stage + fused_span
             } else {
                 stage + 1
             };
@@ -1611,8 +1638,9 @@ pub fn benchmark_vulkan_kernel_only_plan(
                         .cmd_dispatch(command_buffer, dispatch.0, dispatch.1, dispatch.2);
                 }
 
+                let fused_span = fused_stage_span(&params, stage);
                 let next_stage = if use_fused {
-                    stage + 2
+                    stage + fused_span
                 } else {
                     stage + 1
                 };
@@ -1866,8 +1894,9 @@ pub fn benchmark_vulkan_e2e_batched_plan(
                         ctx.device
                             .cmd_dispatch(command_buffer, dispatch.0, dispatch.1, dispatch.2);
                     }
+                    let fused_span = fused_stage_span(&params, stage);
                     let next_stage = if use_fused {
-                        stage + 2
+                        stage + fused_span
                     } else {
                         stage + 1
                     };
