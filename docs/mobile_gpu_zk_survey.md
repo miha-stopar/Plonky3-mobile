@@ -1,15 +1,10 @@
 # Mobile GPU Optimizations for SNARKs and STARKs
 
-Status: living document  
-Last updated: 2026-03-13
-
 This document is a research-and-engineering survey focused on zero-knowledge proving on phone-class GPUs: Android Vulkan/WebGPU devices, Apple Metal devices, and browser-exposed mobile GPUs.
-
-It is written from a prover-engineering perspective rather than a purely cryptographic one. The main question is not only "what is asymptotically good?", but also "what can actually run on a phone without melting the device or exhausting memory?".
 
 ## Executive Summary
 
-Phone GPU proving is still much less explored than datacenter GPU proving. The public ZK acceleration ecosystem is still dominated by CUDA-first work such as [ICICLE](https://github.com/ingonyama-zk/icicle), [cuZK](https://github.com/speakspeak/cuZK), [PipeZK](https://www.microsoft.com/en-us/research/publication/pipezk-accelerating-zero-knowledge-proof-with-a-pipelined-architecture/), and newer end-to-end platforms like [ZKPoG](https://eprint.iacr.org/2025/765). By contrast, public mobile-oriented proving efforts are relatively recent and comparatively sparse: [IMP1](https://github.com/ingonyama-zk/imp1), [PocketProof](https://www.ingonyama.com/pocketproof), [Mopro](https://github.com/zkmopro/mopro), [ICICLE Metal backend docs](https://dev.ingonyama.com/start/architecture/install_gpu_backend), and practitioner reports such as [zkSecurity's WebGPU/Stwo write-up](https://blog.zksecurity.xyz/posts/webgpu/).
+Public ZK GPU acceleration is still weighted toward server-oriented CUDA work, with representative examples including [ICICLE](https://github.com/ingonyama-zk/icicle), [cuZK](https://github.com/speakspeak/cuZK), and [PipeZK](https://www.microsoft.com/en-us/research/publication/pipezk-accelerating-zero-knowledge-proof-with-a-pipelined-architecture/). Mobile and browser-facing efforts are fewer, but they are growing, especially around Vulkan, Metal, and WebGPU.
 
 For STARK-like and post-quantum-transparent systems, mobile GPUs are attractive because much of the workload is hashes, field arithmetic, and FFT/NTT-like operations rather than elliptic-curve pairings. But this does not automatically make them easy targets. The bottlenecks move toward memory bandwidth, trace size, Merkle commitment traffic, and sustained thermally-limited throughput.
 
@@ -43,17 +38,15 @@ This does not mean Stockham is always universally best. High-performance librari
 
 Still, the broad GPU trend is real: the closer a library is to bandwidth-bound FFT execution, the more valuable it becomes to avoid standalone global permutations.
 
-### Public Evidence by Library
+### Representative Libraries
 
-The table below is deliberately careful about what is directly stated by public sources versus what is engineering inference.
-
-| Library | GPU vendors / APIs | What public sources indicate | Source quality |
-|---|---|---|---|
-| [VkFFT](https://github.com/DTolm/VkFFT) | NVIDIA / AMD / Intel / Apple via Vulkan, CUDA, HIP, OpenCL, Level Zero, Metal | Public docs emphasize in-place operation, minimized transpositions, and four-step reshuffling only for large sequences. In practice VkFFT is commonly grouped with Stockham-oriented GPU FFT designs, but I did not find a single explicit official sentence in the checked sources saying "VkFFT uses Stockham". | Medium; partly inference |
-| [SMFFT](https://github.com/KAdamek/SMFFT) | NVIDIA CUDA | Explicitly includes both Cooley-Tukey and Stockham implementations; the Stockham implementation is described as autosort and producing correctly ordered output without an explicit reorder step. | High |
-| [Microsoft GPU FFT research](https://www.microsoft.com/en-us/research/publication/fast-computation-of-general-fourier-transforms-on-gpus/) | Early GPU work, NVIDIA-focused experiments | Explicitly states radix-2 Stockham as the basic building block; later Microsoft work also highlights hierarchical FFTs using Stockham formulations. | High |
-| [rocFFT](https://rocm.docs.amd.com/projects/rocFFT/en/develop/design/runtime_compilation.html) | AMD ROCm / HIP | AMD's runtime compilation design docs say Stockham FFT kernels make up the vast majority of the library; codegen docs also discuss tiled/strided/batched Stockham kernels. | High |
-| [cuFFT](https://docs.nvidia.com/cuda/cufft/) | NVIDIA CUDA | Official docs specify Cooley-Tukey building blocks for favorable sizes and Bluestein for difficult sizes, but do not fully document internal kernel families. It is safest to describe cuFFT publicly as mixed-radix / mixed-strategy rather than purely Stockham. | High for "mixed"; low for deeper internals |
+| Library | GPU vendors / APIs | Public documentation / implementation notes |
+|---|---|---|
+| [VkFFT](https://github.com/DTolm/VkFFT) | NVIDIA / AMD / Intel / Apple via Vulkan, CUDA, HIP, OpenCL, Level Zero, Metal | The [VkFFT API guide](https://github.com/DTolm/VkFFT/blob/066a17c17068c0f11c9298d848c2976c71fad1c1/documentation/VkFFT_API_guide.tex#L458) states that VkFFT reduces its algorithms to a mixed-radix Cooley-Tukey FFT in Stockham autosort form. |
+| [SMFFT](https://github.com/KAdamek/SMFFT) | NVIDIA CUDA | The project includes both Cooley-Tukey and Stockham implementations; the Stockham path is presented as an autosort FFT that avoids a separate reorder step. |
+| [Microsoft GPU FFT research](https://www.microsoft.com/en-us/research/publication/fast-computation-of-general-fourier-transforms-on-gpus/) | Early GPU work, NVIDIA-focused experiments | The Microsoft papers explicitly use radix-2 Stockham as a basic building block and combine it with hierarchical use of shared memory. |
+| [rocFFT](https://rocm.docs.amd.com/projects/rocFFT/en/develop/design/runtime_compilation.html) | AMD ROCm / HIP | AMD's runtime-compilation and codegen docs describe rocFFT as being dominated by Stockham kernels, including specialized tiled, strided, and batched variants. |
+| [cuFFT](https://docs.nvidia.com/cuda/cufft/) | NVIDIA CUDA | NVIDIA's public docs describe Cooley-Tukey decompositions for favorable sizes and Bluestein for arbitrary sizes; the public interface does not present one single universal kernel family. |
 
 ### Why This Matters for ZK
 
@@ -64,85 +57,40 @@ For ZK proving, FFT/NTT passes often dominate polynomial evaluation/interpolatio
 
 That is why the Stockham-style lesson transfers directly into phone-class ZK implementations: avoiding standalone global permutations is often worth more than shaving a few arithmetic instructions.
 
-## Ozcan-Savas NTT Paper: What It Actually Contributes
+## Representative GPU FFT/NTT Papers and Engineering Lessons
 
-The paper [Two Algorithms for Fast GPU Implementation of NTT](https://eprint.iacr.org/2023/1410) is worth reading carefully because it is much closer to the engineering problems in a phone prover than many protocol papers are. Its abstract is unusually clear about the real bottleneck: NTT is often memory-bound, so the decisive question is not only "how many butterfly operations?" but "how much slow global memory traffic and synchronization do we force?".
+Several papers and implementation lines matter here, not only one.
 
-The paper proposes two GPU-oriented NTT families:
+### Bailey and Hierarchical-Memory FFTs
 
-- `Merge-NTT`: reduce the number of GPU kernel launches and global-memory synchronization points by merging multiple sequential NTT stages into one kernel when the memory hierarchy allows it.
-- `4-Step NTT`: restructure the transform so that the memory access pattern becomes more local and spatially coherent, following the classical 4-step FFT idea used on hierarchical-memory machines.
+David Bailey's [FFTs in external or hierarchical memory](https://ntrs.nasa.gov/citations/19900047338) is one of the clearest statements of the `4-step` idea. The large transform is reorganized into shorter transforms and transposes so that memory access stays regular and unit-stride as much as possible. This is still one of the most relevant design ideas for phone GPUs because threadgroup/shared memory is too small to hold an entire large transform.
 
-### 1. Merge-NTT
+### Microsoft GPU FFT Papers
 
-The paper's first algorithm starts from the familiar iterative radix-2 NTT structure: there are `log2(n)` outer loop iterations, and each outer loop corresponds to one stage width. A naive GPU mapping launches one kernel per outer loop iteration. That is simple, but it means:
+The Microsoft papers on [Fast Computation of General Fourier Transforms on GPUs](https://www.microsoft.com/en-us/research/publication/fast-computation-of-general-fourier-transforms-on-gpus/), [High Performance Discrete Fourier Transforms on Graphics Processors](https://www.microsoft.com/en-us/research/publication/high-performance-discrete-fourier-transforms-on-graphics-processors/), and [Auto-tuning of Fast Fourier Transform on Graphics Processors](https://www.microsoft.com/en-us/research/publication/auto-tuning-of-fast-fourier-transform-on-graphics-processors/) are important because they connect three ideas that still dominate current practice:
 
-- a fresh kernel launch per stage,
-- a global-memory round-trip between stages,
-- and a full device-level synchronization point between stages.
+- Stockham-style autosort kernels,
+- hierarchical use of shared memory,
+- and hardware-specific tuning of launch parameters.
 
-Ozcan and Savas attack exactly that cost. Their `Merge-NTT` idea is to fuse several consecutive outer-loop iterations into one GPU kernel whenever the working set still fits the fast levels of the memory hierarchy. The paper's abstract says the implementation is highly sensitive to CUDA parameters such as kernel count, block size, and block shape, and that one of its contributions is a recipe for selecting them for a given polynomial degree.
+### GPU NTT Papers from the HE Literature
 
-Conceptually, this is the same systems idea as the fused stage-window kernels we have already been experimenting with in this repo:
+The Sabanci work around [GPU Acceleration of Approximate Homomorphic Encryption](https://eprint.iacr.org/2021/124), [Homomorphic Encryption on GPU](https://eprint.iacr.org/2022/1222), [Two Algorithms for Fast GPU Implementation of NTT](https://eprint.iacr.org/2023/1410), and the newer [High-Performance NTT on GPU Through radix2-CT and 4-Step Algorithms](https://eprint.iacr.org/2025/388) is useful because it treats NTT as a memory-system problem. Across these papers, the recurring implementation ideas are:
 
-- keep data on chip for as long as possible,
-- do several dependent butterfly stages before writing back,
-- and pay the host/device synchronization cost less often.
+- merge several stages into one kernel when locality allows,
+- use `4-step` decompositions for large transforms,
+- tune block shape / launch geometry rather than treating them as constants,
+- and select algorithm families by problem size instead of forcing one universal kernel.
 
-This is not a cryptographic trick. It is a memory-traffic trick.
+### Transparent-Prover Case Studies
 
-### 2. 4-Step NTT
+[Air-FRI: Acceleration of the FRI Protocol on the GPU for zkSNARK Applications](https://uwspace.uwaterloo.ca/items/6cee69e5-c9cf-4ef2-ba59-ca3541b58f71) matters because it moves the discussion from isolated NTT kernels to the broader transparent-prover pipeline. The important shift is that the performance question becomes "how does the full prover move data through evaluation, commitment, and query phases?" rather than "how fast is one butterfly?".
 
-The second algorithm is the more structurally important one.
+The common lesson across these papers is straightforward: phone GPUs need the same algorithmic ingredients as server GPUs, but the constraints are tighter, so memory layout, kernel fusion, and transform decomposition matter even more.
 
-The paper says it adopts the `4-Step` method to improve spatial locality of global memory access. The historical idea comes from David Bailey's [FFTs in external or hierarchical memory](https://ntrs.nasa.gov/citations/19900047338), which treats a long transform as a matrix, performs smaller transforms on one dimension, multiplies by twiddle factors, and then transforms along the other dimension. The point of the method is not to change the math. The point is to turn long-stride memory access into more regular, contiguous access that better fits hierarchical memory systems.
+## Representative Projects and Public Implementations
 
-The 4-step pattern is:
-
-1. Reshape the length-`n` vector into a 2D matrix.
-2. Compute many shorter transforms on one matrix dimension.
-3. Multiply by the corresponding twiddle factors.
-4. Transpose / reorder so the next short transforms are again memory-friendly.
-5. Compute the transforms on the other dimension.
-6. Transpose back if needed for the expected output layout.
-
-Why this matters on GPU:
-
-- global memory likes regular, coalesced access,
-- shared memory / threadgroup memory is too small for the full transform,
-- and short local transforms are much easier to schedule well than one monolithic large transform with terrible strides.
-
-This is exactly the kind of idea that becomes more relevant on phones, not less, because mobile GPUs are even more sensitive to bandwidth and locality than server GPUs.
-
-### 3. What Ideas It Inherits From the References It Cites
-
-The most important referenced ideas behind the paper are these:
-
-- `Bailey 4-step FFT`: use matrix decomposition and transposes to match a hierarchical memory system instead of forcing a huge transform to fight the memory hierarchy. Bailey's paper explicitly emphasizes unit-stride transfers and minimizing passes over external memory.
-- `Earlier GPU NTT for HE`: the Sabanci line of work around [GPU Acceleration of Approximate Homomorphic Encryption](https://eprint.iacr.org/2021/124) and [Homomorphic Encryption on GPU](https://eprint.iacr.org/2022/1222) focuses on minimizing kernel calls, using the GPU memory hierarchy efficiently, and tuning launch geometry for NTT-heavy workloads.
-- `GPU FFT literature`: the same memory-locality story appears in older Microsoft FFT work and in modern GPU FFT libraries. Even when the algorithm family differs, the same implementation rule keeps recurring: reduce scattered global memory traffic and structure the transform around what fast local memory can hold.
-
-So the paper is not presenting two isolated tricks. It is combining three longstanding HPC ideas:
-
-- fuse dependent stages when locality allows,
-- decompose large transforms into memory-friendly subtransforms,
-- and tune launch geometry as a first-class part of the algorithm.
-
-### 4. What This Means for Phone GPUs
-
-For a phone prover, the paper suggests three practical directions.
-
-First, stage fusion is worth doing, but only while the tile still fits the local memory budget. That is the same limit we keep hitting with full-column ownership for large `h`.
-
-Second, once the transform is too large for simple fused tiling, a `4-step` style decomposition is the natural next move. It is a better fit than just "keep launching one more stage kernel" because it actively repairs locality.
-
-Third, the launch parameters are part of the algorithm. The paper is explicit that the optimum depends on degree and hardware. That is especially true on mobile, where subgroup size, local-memory limits, and thermal behavior vary significantly by vendor.
-
-## The Current Ecosystem: Why Phone GPU ZK Still Looks Underexplored
-
-The public ecosystem today is still heavily skewed toward server-side NVIDIA GPUs.
-
-### GPU ZK Work That Is Mostly Server / CUDA First
+### Server-Oriented Acceleration Stacks
 
 - [ICICLE](https://github.com/ingonyama-zk/icicle): hardware acceleration library for ZK primitives across multiple backends, but public open source remains strongest on the CPU/frontend side while CUDA acceleration has historically been the main proving story.
 - [cuZK](https://github.com/speakspeak/cuZK): GPU implementation of zkSNARK proving with emphasis on MSM and NTT.
@@ -150,33 +98,16 @@ The public ecosystem today is still heavily skewed toward server-side NVIDIA GPU
 - [ZKPoG](https://eprint.iacr.org/2025/765): end-to-end GPU acceleration including witness generation for Plonkish pipelines.
 - [ICICLE-Stwo](https://www.ingonyama.com/post/introducing-icicle-stwo-a-gpu-accelerated-stwo-prover): GPU acceleration of StarkWare's Stwo prover, reporting 3.25x to 7x over the SIMD backend.
 
-### Mobile / Client-Side Efforts That Are Public
+### Mobile and Browser-Facing Efforts
 
 - [IMP1](https://github.com/ingonyama-zk/imp1): explicitly a mobile-first proving framework for iOS and Android, described as a mobile-optimized Groth16 prover. The README claims up to 3x faster than Rapidsnark on supported devices.
 - [PocketProof](https://www.ingonyama.com/pocketproof): packaging and distribution layer for the same mobile proving direction.
-- [Mopro](https://github.com/zkmopro/mopro): mobile tooling and bindings rather than a single GPU backend, but strategically important because mobile ZK adoption depends on integration tooling, not just kernels.
 - [ICICLE Metal backend docs](https://dev.ingonyama.com/start/architecture/install_gpu_backend) and [architecture overview](https://dev.ingonyama.com/3.6.0/icicle/arch_overview): shows serious movement beyond CUDA, at least for Apple devices.
 - [zkSecurity's WebGPU/Stwo article](https://blog.zksecurity.xyz/posts/webgpu/): one of the clearest public practitioner write-ups on mobile-compatible GPU proving via WebGPU, including real engineering constraints.
 - [QED's plonky2-wasm](https://github.com/QEDProtocol/plonky2-wasm): browser/client-side experimentation with WebGPU-oriented proving.
 - [msm-webgpu](https://lib.rs/crates/msm-webgpu): WebGPU MSM work that points toward browser/mobile-compatible ECC acceleration, though still far from a mature proving stack.
 
-### Academic and Practitioner Work Worth Tracking
-
-- [Air-FRI: Acceleration of the FRI Protocol on the GPU for zkSNARK Applications](https://uwspace.uwaterloo.ca/items/6cee69e5-c9cf-4ef2-ba59-ca3541b58f71): useful because it treats FRI acceleration as a concrete GPU systems problem rather than a vague "GPU helps hashing" statement. Even though the thesis is not phone-specific, it is directly relevant to mobile because the same phases dominate: polynomial evaluation, FFT-like work, and commitment/query pipelines.
-- [zkSecurity's WebGPU/Stwo article](https://blog.zksecurity.xyz/posts/webgpu/): one of the most concrete public descriptions of getting a transparent prover onto a browser/mobile-compatible GPU stack.
-
-Air-FRI is particularly important in this survey because it shows the right way to think about transparent-proof acceleration. The point is not merely that a GPU can evaluate some arithmetic faster than a CPU. The point is that FRI-like provers are a pipeline of domain evaluation, mixing/folding, and commitment work whose performance depends heavily on memory traffic and kernel orchestration. That framing transfers directly to phone GPUs, where memory movement is even more decisive.
-
-### Why It Still Feels Underexplored
-
-There are several structural reasons:
-
-- CUDA gave the ecosystem a fast path to impressive speedups on commodity datacenter GPUs, so most teams optimized there first.
-- Mobile hardware is fragmented across Vulkan, Metal, browser WebGPU, and vendor-specific quirks.
-- Phones are thermally constrained; sustained throughput matters more than short benchmark bursts.
-- Public benchmarking and regression infrastructure across many phone models is still weak.
-- Memory budgets are much tighter, especially for transparent/post-quantum protocols with large traces or codewords.
-- The market incentive has historically been stronger for rollup sequencers and proving services than for client-side proving.
+The main gap is not a complete absence of work. The gap is that the public ecosystem is still much richer for server CUDA than for reusable phone-grade Vulkan / Metal / WebGPU proving primitives.
 
 ## Why Phone GPUs Differ from "Normal" CUDA GPUs
 
@@ -315,7 +246,7 @@ Stwo is especially interesting here because StarkWare explicitly designed it aro
 
 Takeaway: FRI-family provers look like the strongest long-term mobile-GPU candidates, but only if they aggressively control memory movement and do not assume datacenter-class bandwidth.
 
-### STIR, WHIR, and Whirlaway
+### STIR and WHIR
 
 These are particularly relevant if the goal is post-quantum, transparent, and possibly more verifier-friendly than classic FRI.
 
@@ -340,8 +271,6 @@ Why they may be harder to optimize on phone GPUs:
 
 The honest current status is that WHIR looks cryptographically compelling, but the mobile GPU engineering playbook for it is much less mature than for classic FFT-heavy STARK pipelines.
 
-[Whirlaway](https://github.com/TomWambsgans/Whirlaway/blob/master/Whirlaway.pdf) is relevant here as a concrete WHIR-adjacent system rather than a vague placeholder name. Based on the PDF abstract, it is a transparent, post-quantum zero-knowledge argument system that combines Fractal-style folding with DEEP-ALI instead of standard FRI, while aiming to preserve Plonkish flexibility and improve proof-size / verifier-cost tradeoffs. For this survey, the practical importance of Whirlaway is not that it changes the mobile GPU answer completely, but that it reinforces the broader trend: newer transparent systems are trying to reduce proof and verification cost, while prover engineering still has to deal with large codewords, memory movement, and irregular folding/query phases.
-
 The practical difference from classic FRI is worth stating explicitly. FRI has a relatively familiar prover shape for systems engineers:
 
 - evaluate over a larger domain,
@@ -350,32 +279,6 @@ The practical difference from classic FRI is worth stating explicitly. FRI has a
 - answer sampled queries.
 
 WHIR and STIR improve parts of that story cryptographically, especially proof size and verifier work, but they do not automatically turn prover execution into a more GPU-friendly workload. In fact, newer transparent systems can increase engineering complexity because the prover is no longer "just a big pile of regular NTTs plus hashing". That is good cryptography, but it can be harder hardware.
-
-### BaseFold, DeepFold, and Other Fold/Code-Based Successors
-
-Representative references:
-
-- [BaseFold](https://eprint.iacr.org/2023/1705)
-- [DeepFold](https://eprint.iacr.org/2024/1595)
-
-These schemes are relevant because they aim to reduce proof size, improve field flexibility, or improve prover/verifier tradeoffs relative to earlier FRI-style systems.
-
-Potential mobile upside:
-
-- moving away from strict FFT-friendly-field assumptions can be valuable in some protocol stacks,
-- multilinear commitments can sometimes align better with applications built around Boolean structure.
-
-Potential mobile downside:
-
-- the prover kernel mix may shift away from the most GPU-familiar batched NTT pattern,
-- code encodings, foldable-code operations, and list-decoding-adjacent analyses may come with more complex data movement,
-- implementation maturity is still lower than "standard FFT plus Merkle" prover pipelines.
-
-Takeaway: these schemes are important research directions, but mobile GPU engineering for them is still less settled than for classic STARK code paths.
-
-### A Note on Whirlaway
-
-Earlier drafts of this survey used the misspelling `Whiraway`. The intended reference is [Whirlaway](https://github.com/TomWambsgans/Whirlaway/blob/master/Whirlaway.pdf), which has a public repository and PDF write-up. In this document it is treated as part of the same practical discussion space as WHIR and other newer transparent/post-quantum systems: attractive verifier-side goals, but still an open question how to make prover kernels mobile-GPU-friendly end to end.
 
 ## What Actually Makes a Post-Quantum Phone Prover Hard
 
@@ -450,7 +353,7 @@ For large transforms, "everything in shared memory" is impossible on phones. The
 - minimize global reshuffles,
 - reduce host-driven micro-dispatches where possible.
 
-This is also the most direct lesson from the Ozcan-Savas paper. The implementation progression is usually:
+This is also the lesson that keeps recurring across the GPU FFT/NTT literature. The implementation progression is usually:
 
 - naive per-stage kernel launches,
 - stage fusion while locality still holds,
@@ -469,55 +372,144 @@ Phones vary too much for one static kernel policy. Workgroup sizes, fusion thres
 
 Use thermal-aware methodology. Android explicitly recommends fixed-performance mode for benchmarking where available: [ADPF](https://developer.android.com/games/optimize/adpf). Without that, comparing one optimization to another can be misleading.
 
-## Practical Research Directions
+## Practical Research Directions and Reusable Primitives
 
-The highest-value directions for mobile/post-quantum ZK optimization appear to be:
+The most useful next step for the ecosystem is not one more monolithic prover. It is a reusable set of mobile-friendly GPU primitives plus a benchmarking and autotuning layer that multiple projects can share.
 
-1. End-to-end GPU residency for FRI-family provers, not just isolated FFT kernels.
-2. Stockham-style or similarly permutation-avoiding NTT/FFT kernels tuned for 32-bit fields.
-3. Merkle/hash pipelines that reduce global memory traffic, possibly via layer fusion or alternative commitment layouts.
-4. Hybrid schedulers that assign large regular kernels to GPU and latency-sensitive tails to CPU.
-5. Runtime per-device tuning for workgroup shape, stage fusion, and memory strategy.
-6. Better open benchmarking suites across many phones, because the field is currently data-poor.
-7. More public implementations of WHIR/STIR/Whirlaway-like provers, so that mobile engineering can catch up to protocol progress.
+### 1. Start with a Benchmark Matrix
 
-## Implications for This Repo
+Before choosing one universal algorithm, it makes sense to benchmark several algorithm families across:
 
-The current `Plonky3-android` Vulkan path already contains the beginning of the right design direction, but not the full hierarchical step yet.
+- transform sizes from small to prover-scale,
+- different widths / batch counts,
+- row-major, column-major, and strided layouts,
+- 32-bit-friendly fields such as M31 / BabyBear and larger-word fields where relevant,
+- three initial target environments: Apple/Metal devices, Android Vulkan devices, and WebGPU-capable browsers.
 
-Relevant files:
+The goal is to learn where each family wins:
 
-- host fused-stage policy: [../native/src/backend_vulkan.rs](../native/src/backend_vulkan.rs)
-- current fused shader: [../native/shaders/fft_stage_fused.wgsl](../native/shaders/fft_stage_fused.wgsl)
+- Stockham / autosort kernels,
+- merged-stage kernels,
+- radix2-CT kernels,
+- `4-step` decompositions for large transforms.
 
-### What It Already Does
+This is the data needed to make dynamic per-device policies real rather than aspirational.
 
-The current host code computes a dynamic fused stage span in [`fused_stage_span`](../native/src/backend_vulkan.rs), capped by a `256`-row tile and a maximum fused stage. The current fused shader loads one `TILE_ROWS` chunk of a column into workgroup memory, performs several stages there, and writes the tile back once.
+### 2. Provide a Reusable DFT / NTT Primitive Layer
 
-That is already close in spirit to `Merge-NTT`:
+A reusable GPU DFT/NTT primitive layer for different layouts would be one of the most useful ecosystem contributions. It would help any project whose prover reduces large parts of the workload to batched polynomial evaluation/interpolation, including `whir-p3` and FRI-family provers more generally.
 
-- fewer host-driven stage dispatches,
-- fewer global-memory round-trips for early stages,
-- and explicit dependence on tile size and workgroup geometry.
+To make that practical, the primitive layer should accept at least:
 
-### What It Does Not Yet Do
+- field descriptor: modulus, reduction method, twiddle-generation rules,
+- transform descriptor: size, direction, batch count, in-place vs out-of-place,
+- layout descriptor: row-major, column-major, strided, transposed, tiled,
+- execution descriptor: preferred residency, temporary-buffer budget, synchronization strategy.
 
-It does not yet implement the more structural `4-step` style decomposition.
+The implementation should not hard-code one kernel family. It should expose multiple backends and choose among them at runtime.
 
-Right now, the overall large transform still looks like:
+### 3. Use Dynamic Per-Device Policies at the Primitive Level
 
-- host drives stage windows,
-- each workgroup owns a row-tile slice of several columns,
-- later stages fall back to broader global-memory behavior.
+In practice, "dynamic per-device policies" means that the primitive layer queries device capabilities and then picks an execution plan. The relevant inputs include:
 
-What a genuine `4-step` move would change is the layout of the large transform itself. Instead of only asking "how many consecutive stages can this tile execute?", the code would ask:
+- local/threadgroup memory limits,
+- subgroup size behavior,
+- maximum workgroup size,
+- vendor / architecture family,
+- measured bandwidth and sustained throughput from a calibration pass.
 
-- how should the big transform be factored into a matrix,
-- which short transforms should be computed first,
-- where should twiddle multiplication happen,
-- and when should we transpose so the next pass is again locality-friendly?
+Then the runtime can choose:
 
-That is a larger rewrite than the current fusion work, but it is the most technically justified next step if the goal is to move beyond stage-window fusion and toward the hierarchical-memory approach the literature recommends.
+- Stockham-style kernels for small or medium transforms where autosort behavior is a clear win,
+- merged-stage kernels while tiles still fit local memory,
+- `4-step` decomposition for larger transforms where locality dominates,
+- hybrid CPU/GPU execution for latency-dominated tails.
+
+This is more useful than building one prover-specific kernel path because the same policy layer could be reused across multiple proof systems.
+
+### 4. Add Layout and Transpose Primitives
+
+If the ecosystem wants `4-step` NTTs and better memory locality, then transpose and layout-conversion kernels are first-class primitives, not implementation details.
+
+Useful reusable primitives include:
+
+- tiled matrix transpose,
+- row-major <-> column-major conversion,
+- strided gather/scatter with bounds-aware tiling,
+- batched twiddle multiplication kernels,
+- permutation kernels for the cases where autosort is not used.
+
+Without these, every project reimplements the same expensive memory-movement layer.
+
+### 5. Add Hash and Merkle Primitives
+
+Transparent systems need more than DFT/NTT. The other high-value reusable layer is commitment-oriented primitives:
+
+- field-friendly hash kernels,
+- leaf hashing over trace/codeword layouts,
+- batched parent-layer compression,
+- optional layer fusion where locality permits,
+- query-path extraction helpers.
+
+A phone-friendly ZK stack needs these to live next to the NTT layer, not in a separate silo.
+
+### 6. Add Folding / Mixing Primitives for Transparent Systems
+
+FRI, WHIR, and STIR-like systems all need some form of folding, mixing, or low-degree-combination step. A reusable library can help by exposing:
+
+- batched linear-combination kernels,
+- domain-mixing kernels,
+- column-wise and row-wise reduction primitives,
+- small-kernel fallbacks for late query/opening phases.
+
+This would help bridge the gap between "FFT library" and "actual transparent prover runtime".
+
+### 7. Add Residency and Execution-Orchestration Primitives
+
+End-to-end GPU residency is important enough that it should be treated as a reusable subsystem, not just an optimization note. A mobile-friendly stack would benefit from:
+
+- GPU buffer residency management for traces, codewords, hashes, and temporary workspaces,
+- command-graph or pipeline-executor support for chaining DFT/NTT, folding, and hashing phases without unnecessary host round-trips,
+- synchronization-minimizing schedulers that batch dependent stages together,
+- explicit CPU/GPU handoff policies for small latency-dominated tails,
+- temporary-buffer planners that can trade memory footprint against extra passes.
+
+This is the part that turns a collection of fast kernels into an actual prover backend.
+
+### 8. Add Memory-Aware Primitives for Transparent Provers
+
+Transparent systems need more than fast kernels; they need memory-aware execution under explicit device limits. Useful reusable components here would include:
+
+- trace/codeword layout planners that choose chunking and tiling based on memory budget,
+- streaming commitment builders for traces too large to process in one resident pass,
+- memory-budget-aware query batching and opening schedulers,
+- chunked folding and composition kernels with explicit scratch-space bounds,
+- protocol-parameter planners that can estimate whether a chosen blowup, width, or batching strategy fits on a target device.
+
+This is the point where "memory-aware protocol choices" becomes something implementable rather than just a design principle.
+
+### 9. Help the Ecosystem with Open Benchmarking and Capability Data
+
+Another concrete contribution would be a public benchmark suite for phone-class GPUs. That suite should report:
+
+- transform throughput and latency by size,
+- hash / Merkle throughput,
+- transpose bandwidth,
+- thermal decay curves,
+- device capability snapshots,
+- chosen runtime policy and why it was chosen.
+
+Right now, the public data is too thin. Better shared measurements would help every project.
+
+### 10. Likely Algorithmic Direction
+
+There is no reason to bet everything on one algorithm family. A realistic reusable stack would likely look like this:
+
+- Stockham-style kernels for permutation-avoiding small and medium transforms,
+- merged-stage fusion where local memory still holds the tile,
+- `4-step` decomposition for large transforms,
+- explicit transpose/layout primitives to support that decomposition,
+- autotuned runtime selection rather than a compile-time constant plan.
 
 ## Bottom Line
 
@@ -530,7 +522,7 @@ The best mobile candidates, especially under post-quantum / transparent constrai
 - hash pipelines that can be staged hierarchically,
 - small enough proof systems or memory layouts to fit within mobile DRAM and thermal limits.
 
-That points strongly toward carefully engineered FRI-family and related transparent systems, including Circle-STARK-style provers and possibly WHIR-family / Whirlaway-like descendants once their implementation ecosystem matures.
+That points strongly toward carefully engineered FRI-family and related transparent systems, including Circle-STARK-style provers and possibly WHIR-family descendants once their implementation ecosystem matures.
 
 ## Sources
 
@@ -538,12 +530,14 @@ That points strongly toward carefully engineered FRI-family and related transpar
 - Microsoft Research, *High Performance Discrete Fourier Transforms on Graphics Processors*: https://www.microsoft.com/en-us/research/publication/high-performance-discrete-fourier-transforms-on-graphics-processors/
 - Microsoft Research, *Auto-tuning of Fast Fourier Transform on Graphics Processors*: https://www.microsoft.com/en-us/research/publication/auto-tuning-of-fast-fourier-transform-on-graphics-processors/
 - Ozcan and Savas, *Two Algorithms for Fast GPU Implementation of NTT*: https://eprint.iacr.org/2023/1410
+- Ozcan et al., *High-Performance NTT on GPU Through radix2-CT and 4-Step Algorithms*: https://eprint.iacr.org/2025/388
 - GPU-NTT repository: https://github.com/Alisah-Ozcan/GPU-NTT
 - Ozcan et al., *GPU Acceleration of Approximate Homomorphic Encryption*: https://eprint.iacr.org/2021/124
 - Ozcan et al., *Homomorphic Encryption on GPU*: https://eprint.iacr.org/2022/1222
 - David H. Bailey, *FFTs in external or hierarchical memory*: https://ntrs.nasa.gov/citations/19900047338
 - SMFFT repository: https://github.com/KAdamek/SMFFT
 - VkFFT repository: https://github.com/DTolm/VkFFT
+- VkFFT API guide: https://github.com/DTolm/VkFFT/blob/066a17c17068c0f11c9298d848c2976c71fad1c1/documentation/VkFFT_API_guide.tex#L458
 - VkFFT paper landing page: https://doi.org/10.1109/access.2023.3242240
 - rocFFT runtime compilation design doc: https://rocm.docs.amd.com/projects/rocFFT/en/develop/design/runtime_compilation.html
 - rocFFT codegen design doc: https://rocm.docs.amd.com/projects/rocFFT/en/docs-5.1.0/design/codegen.html
@@ -555,12 +549,8 @@ That points strongly toward carefully engineered FRI-family and related transpar
 - IMP1 mobile prover repository: https://github.com/ingonyama-zk/imp1
 - IMP1 mobile post: https://www.ingonyama.com/post/imp1-bringing-zero-knowledge-proofs-to-mobile
 - PocketProof: https://www.ingonyama.com/pocketproof
-- Mopro repository: https://github.com/zkmopro/mopro
-- Mopro docs: https://zkmopro.org/docs/intro
-- PSE client-side proving page: https://pse.dev/projects/client-side-proving
 - Air-FRI thesis entry: https://uwspace.uwaterloo.ca/items/6cee69e5-c9cf-4ef2-ba59-ca3541b58f71
 - WHIR paper: https://eprint.iacr.org/2024/1586
-- Whirlaway PDF: https://github.com/TomWambsgans/Whirlaway/blob/master/Whirlaway.pdf
 - STIR paper: https://eprint.iacr.org/2024/390
 - BaseFold paper: https://eprint.iacr.org/2023/1705
 - DeepFold paper: https://eprint.iacr.org/2024/1595
